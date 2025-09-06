@@ -616,6 +616,9 @@ def get_terminal_keyboard(mode="navigation"):
                 InlineKeyboardButton("🎛️ Ctrl", callback_data="kbd:ctrl"),
                 InlineKeyboardButton("⚡ Special", callback_data="kbd:special"),
                 InlineKeyboardButton("🔧 F-Keys", callback_data="kbd:function"),
+            ],
+            [
+                InlineKeyboardButton("🖥️ Open Web Terminal", callback_data="webapp:launch"),
             ]
         ]
     
@@ -643,6 +646,9 @@ def get_terminal_keyboard(mode="navigation"):
             ],
             [
                 InlineKeyboardButton("🔙 Back", callback_data="kbd:navigation"),
+            ],
+            [
+                InlineKeyboardButton("🖥️ Open Web Terminal", callback_data="webapp:launch"),
             ]
         ]
     
@@ -659,6 +665,9 @@ def get_terminal_keyboard(mode="navigation"):
             ],
             [
                 InlineKeyboardButton("🔙 Back", callback_data="kbd:navigation"),
+            ],
+            [
+                InlineKeyboardButton("🖥️ Open Web Terminal", callback_data="webapp:launch"),
             ]
         ]
     
@@ -678,6 +687,9 @@ def get_terminal_keyboard(mode="navigation"):
             ],
             [
                 InlineKeyboardButton("🔙 Back", callback_data="kbd:navigation"),
+            ],
+            [
+                InlineKeyboardButton("🖥️ Open Web Terminal", callback_data="webapp:launch"),
             ]
         ]
     
@@ -753,6 +765,30 @@ async def keyboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sess.keyboard_msg_id = keyboard_msg.message_id
             except Exception:
                 pass
+    
+    elif data == "webapp:launch":
+        # Launch web app from inline button
+        webapp_url = os.environ.get("WEBAPP_URL", "https://your-domain.com/webapp")
+        
+        keyboard = [[
+            InlineKeyboardButton(
+                text="🖥️ Open Terminal Web App",
+                web_app=WebAppInfo(url=webapp_url)
+            )
+        ]]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Click the button below to open the terminal in a full-screen web app:\n\n"
+                 "This provides a better terminal experience with:\n"
+                 "• Full keyboard support\n"
+                 "• Better copy/paste\n"
+                 "• Proper terminal rendering\n"
+                 "• Touch-friendly controls",
+            reply_markup=reply_markup
+        )
 
 
 async def webapp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
