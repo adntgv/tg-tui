@@ -20,7 +20,7 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import pexpect
@@ -29,7 +29,7 @@ import pexpect
 # Allow only these Telegram user IDs to use the bot (REQUIRED!)
 AUTHORIZED_USER_IDS = {
     # e.g. 123456789,
-    #289310951
+    289310951
 }
 
 # Optional: default shell and working directory
@@ -172,6 +172,8 @@ HELP_TEXT = textwrap.dedent(
 
 Commands:
   /startsh            Start an interactive shell in this chat
+  /tui start          Start TUI mode with inline keyboard
+  /webapp             Open full terminal web app
   /stop               Stop the running shell
   /send <text>        Send raw text (no added newline) to the shell
   Type anything else  Sends the line to the shell with a newline
@@ -180,6 +182,7 @@ Notes:
 - This opens a PTY, so interactive programs (ssh, python REPL, top, etc.) work.
 - Full-screen TUIs (vim, top) may be hard to use over Telegram due to screen updates.
 - For passwords/prompts, just type the input as a message.
+- Web app provides the best terminal experience!
 """
 )
 
@@ -752,6 +755,35 @@ async def keyboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 
+async def webapp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Launch the terminal web app"""
+    if not await ensure_auth(update):
+        return await update.effective_message.reply_text("Unauthorized.")
+    
+    # Web app URL - you'll need to host this somewhere accessible
+    # For local testing, you can use ngrok or similar tunneling service
+    webapp_url = os.environ.get("WEBAPP_URL", "https://your-domain.com/webapp")
+    
+    keyboard = [[
+        InlineKeyboardButton(
+            text="🖥️ Open Terminal Web App",
+            web_app=WebAppInfo(url=webapp_url)
+        )
+    ]]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.effective_message.reply_text(
+        "Click the button below to open the terminal in a full-screen web app:\n\n"
+        "This provides a better terminal experience with:\n"
+        "• Full keyboard support\n"
+        "• Better copy/paste\n"
+        "• Proper terminal rendering\n"
+        "• Touch-friendly controls",
+        reply_markup=reply_markup
+    )
+
+
 # ------------------------- MAIN -------------------------
 async def main() -> None:
     token = os.environ.get("TELEGRAM_TOKEN")
@@ -771,6 +803,9 @@ async def main() -> None:
     # TUI snapshot mode handlers
     app.add_handler(CommandHandler("tui", tui_cmd))
     app.add_handler(CommandHandler("key", key_cmd))
+    
+    # Web app handler
+    app.add_handler(CommandHandler("webapp", webapp_cmd))
     
     # Inline keyboard handler
     app.add_handler(CallbackQueryHandler(keyboard_callback))

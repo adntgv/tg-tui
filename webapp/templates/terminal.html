@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Telegram Terminal</title>
+    
+    <!-- Telegram Web App SDK -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    
+    <!-- xterm.js for terminal emulation -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.js"></script>
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            overflow: hidden;
+            background: var(--tg-theme-bg-color, #1c1c1e);
+            color: var(--tg-theme-text-color, #ffffff);
+        }
+        
+        #terminal-container {
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        #terminal {
+            flex: 1;
+            overflow: hidden;
+        }
+        
+        #toolbar {
+            display: flex;
+            gap: 5px;
+            padding: 5px;
+            background: var(--tg-theme-secondary-bg-color, #2c2c2e);
+            border-top: 1px solid var(--tg-theme-hint-color, #999999);
+            flex-wrap: wrap;
+            justify-content: center;
+            transition: transform 0.3s ease;
+        }
+        
+        #toolbar.hidden {
+            transform: translateY(100%);
+        }
+        
+        .toolbar-btn {
+            padding: 8px 12px;
+            background: var(--tg-theme-button-color, #007aff);
+            color: var(--tg-theme-button-text-color, #ffffff);
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+            touch-action: manipulation;
+        }
+        
+        .toolbar-btn:active {
+            opacity: 0.7;
+        }
+        
+        .toolbar-btn.small {
+            padding: 6px 10px;
+            font-size: 12px;
+        }
+        
+        #status {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 5px 10px;
+            background: rgba(0, 0, 0, 0.5);
+            border-radius: 5px;
+            font-size: 12px;
+            display: none;
+        }
+        
+        #status.connected {
+            display: block;
+            background: rgba(0, 128, 0, 0.5);
+        }
+        
+        #status.disconnected {
+            display: block;
+            background: rgba(255, 0, 0, 0.5);
+        }
+        
+        .keyboard-section {
+            display: flex;
+            gap: 3px;
+            width: 100%;
+            justify-content: center;
+        }
+        
+        #keyboard-toggle {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background: var(--tg-theme-button-color, #007aff);
+            color: var(--tg-theme-button-text-color, #ffffff);
+            border: none;
+            font-size: 20px;
+            cursor: pointer;
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+            transition: transform 0.2s;
+        }
+        
+        #keyboard-toggle:active {
+            transform: scale(0.9);
+        }
+    </style>
+</head>
+<body>
+    <div id="terminal-container">
+        <div id="terminal"></div>
+        <div id="toolbar">
+            <!-- Arrow keys -->
+            <div class="keyboard-section">
+                <button class="toolbar-btn small" data-key="ArrowUp">↑</button>
+                <button class="toolbar-btn small" data-key="ArrowDown">↓</button>
+                <button class="toolbar-btn small" data-key="ArrowLeft">←</button>
+                <button class="toolbar-btn small" data-key="ArrowRight">→</button>
+            </div>
+            
+            <!-- Common keys -->
+            <div class="keyboard-section">
+                <button class="toolbar-btn small" data-key="Tab">Tab</button>
+                <button class="toolbar-btn small" data-key="Escape">Esc</button>
+                <button class="toolbar-btn small" data-key="Enter">Enter</button>
+                <button class="toolbar-btn small" data-key="Backspace">⌫</button>
+            </div>
+            
+            <!-- Control keys -->
+            <div class="keyboard-section">
+                <button class="toolbar-btn small" data-key="Control+c">Ctrl+C</button>
+                <button class="toolbar-btn small" data-key="Control+d">Ctrl+D</button>
+                <button class="toolbar-btn small" data-key="Control+z">Ctrl+Z</button>
+                <button class="toolbar-btn small" data-key="Control+l">Ctrl+L</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="status">Connecting...</div>
+    
+    <!-- Keyboard toggle button -->
+    <button id="keyboard-toggle" title="Toggle Keyboard">⌨️</button>
+    
+    <script>
+        // Initialize Telegram Web App
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand();
+        
+        // Get user info
+        const user = tg.initDataUnsafe?.user;
+        const userId = user?.id || 'anonymous';
+        
+        // Initialize terminal
+        const term = new Terminal({
+            cursorBlink: true,
+            fontSize: 14,
+            fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+            theme: {
+                background: tg.themeParams.bg_color || '#1c1c1e',
+                foreground: tg.themeParams.text_color || '#ffffff',
+                cursor: tg.themeParams.link_color || '#007aff',
+            },
+            allowProposedApi: true
+        });
+        
+        // Fit addon
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        
+        // Web links addon
+        const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+        term.loadAddon(webLinksAddon);
+        
+        // Open terminal in container
+        term.open(document.getElementById('terminal'));
+        fitAddon.fit();
+        
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            fitAddon.fit();
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'resize',
+                    cols: term.cols,
+                    rows: term.rows
+                }));
+            }
+        });
+        
+        // WebSocket connection
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${protocol}//${window.location.host}/ws/${userId}`);
+        
+        ws.onopen = () => {
+            document.getElementById('status').className = 'connected';
+            document.getElementById('status').textContent = 'Connected';
+            
+            // Send initial size
+            ws.send(JSON.stringify({
+                type: 'resize',
+                cols: term.cols,
+                rows: term.rows
+            }));
+        };
+        
+        ws.onmessage = (event) => {
+            // Handle binary data from server
+            if (event.data instanceof Blob) {
+                event.data.text().then(text => {
+                    term.write(text);
+                });
+            } else {
+                term.write(event.data);
+            }
+        };
+        
+        ws.onclose = () => {
+            document.getElementById('status').className = 'disconnected';
+            document.getElementById('status').textContent = 'Disconnected';
+            term.write('\r\n\x1b[31mConnection closed\x1b[0m\r\n');
+        };
+        
+        ws.onerror = (error) => {
+            document.getElementById('status').className = 'disconnected';
+            document.getElementById('status').textContent = 'Error';
+            console.error('WebSocket error:', error);
+        };
+        
+        // Handle terminal input
+        term.onData((data) => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'input',
+                    data: data
+                }));
+            }
+        });
+        
+        // Handle toolbar buttons
+        document.querySelectorAll('[data-key]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const key = btn.dataset.key;
+                let data = '';
+                
+                // Map keys to terminal sequences
+                const keyMap = {
+                    'ArrowUp': '\x1b[A',
+                    'ArrowDown': '\x1b[B',
+                    'ArrowLeft': '\x1b[D',
+                    'ArrowRight': '\x1b[C',
+                    'Tab': '\t',
+                    'Escape': '\x1b',
+                    'Enter': '\r',
+                    'Backspace': '\x7f',
+                    'Control+c': '\x03',
+                    'Control+d': '\x04',
+                    'Control+z': '\x1a',
+                    'Control+l': '\x0c',
+                };
+                
+                data = keyMap[key] || '';
+                
+                if (data && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'input',
+                        data: data
+                    }));
+                }
+                
+                // Focus back to terminal
+                term.focus();
+            });
+        });
+        
+        // Focus terminal on start
+        term.focus();
+        
+        // Handle keyboard toggle button
+        const keyboardToggle = document.getElementById('keyboard-toggle');
+        const toolbar = document.getElementById('toolbar');
+        let keyboardVisible = true;
+        
+        keyboardToggle.addEventListener('click', () => {
+            keyboardVisible = !keyboardVisible;
+            if (keyboardVisible) {
+                toolbar.classList.remove('hidden');
+                keyboardToggle.innerHTML = '⌨️';
+                keyboardToggle.title = 'Hide Keyboard';
+            } else {
+                toolbar.classList.add('hidden');
+                keyboardToggle.innerHTML = '📺';
+                keyboardToggle.title = 'Show Keyboard';
+                // Focus terminal when hiding keyboard
+                term.focus();
+            }
+            
+            // Resize terminal to use new available space
+            setTimeout(() => {
+                fitAddon.fit();
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'resize',
+                        cols: term.cols,
+                        rows: term.rows
+                    }));
+                }
+            }, 350); // Wait for transition to complete
+        });
+        
+        // Handle back button
+        tg.BackButton.show();
+        tg.BackButton.onClick(() => {
+            if (ws) {
+                ws.close();
+            }
+            tg.close();
+        });
+    </script>
+</body>
+</html>
