@@ -19,10 +19,15 @@ from dataclasses import dataclass
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+# from fastapi.staticfiles import StaticFiles  # Not used currently
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 import uvicorn
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuration
 AUTHORIZED_USER_IDS = {289310951}  # Same as main bot
@@ -30,7 +35,14 @@ DEFAULT_SHELL = os.environ.get("SHELL", "/bin/bash")
 DEFAULT_CWD = os.getcwd()
 
 app = FastAPI()
-templates = Jinja2Templates(directory="templates")
+
+# Initialize templates - with error handling
+try:
+    templates = Jinja2Templates(directory="templates")
+    logger.info("Templates initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize templates: {e}")
+    templates = None
 
 # Track active sessions
 @dataclass
@@ -43,10 +55,19 @@ class TerminalSession:
 sessions: Dict[str, TerminalSession] = {}
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Log startup information"""
+    logger.info("Starting Telegram Terminal Web App")
+    logger.info(f"Port: {os.environ.get('PORT', '8000')}")
+    logger.info(f"Default Shell: {DEFAULT_SHELL}")
+    logger.info(f"Templates configured: {templates is not None}")
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint"""
-    return {"status": "healthy"}
+    return {"status": "healthy", "templates_loaded": templates is not None}
 
 
 @app.post("/webhook")
@@ -59,7 +80,10 @@ async def webhook(request: FastAPIRequest):
 @app.get("/")
 async def root(request: Request):
     """Serve the terminal HTML page"""
-    return templates.TemplateResponse("terminal.html", {"request": request})
+    if templates:
+        return templates.TemplateResponse("terminal.html", {"request": request})
+    else:
+        return HTMLResponse(content="<h1>Terminal Web App</h1><p>Templates not configured</p>", status_code=500)
 
 
 @app.websocket("/ws/{user_id}")
