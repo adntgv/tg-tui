@@ -1,0 +1,38 @@
+{
+  "name": "tg-tui",
+  "description": "Telegram Terminal User Interface Bot",
+  "type": "docker-compose",
+  "compose": {
+    "file": "docker-compose.coolify.yml"
+  },
+  "environment": {
+    "TELEGRAM_TOKEN": "${TELEGRAM_TOKEN}",
+    "WEBAPP_URL": "${WEBAPP_URL}",
+    "WEBAPP_PORT": "8000"
+  },
+  "build": {
+    "context": ".",
+    "dockerfile": "Dockerfile.bot"
+  },
+  "services": {
+    "bot": {
+      "restart": "always",
+      "depends_on": ["webapp"]
+    },
+    "webapp": {
+      "restart": "always",
+      "expose": [8000],
+      "healthcheck": {
+        "test": ["CMD", "curl", "-f", "http://localhost:8000/health"],
+        "interval": "30s",
+        "timeout": "10s",
+        "retries": 3
+      }
+    }
+  },
+  "deployment": {
+    "strategy": "rolling",
+    "auto_deploy": false,
+    "branch": "main"
+  }
+}
