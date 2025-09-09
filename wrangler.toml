@@ -1,0 +1,20 @@
+name = "tg-tui-webapp"
+main = "webapp/worker.js"
+compatibility_date = "2024-01-01"
+
+[env.production]
+vars = { ENVIRONMENT = "production" }
+
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "your_kv_namespace_id"
+
+[site]
+bucket = "./webapp/static"
+
+[build]
+command = "npm run build"
+
+[dev]
+port = 8787
+local_protocol = "http"

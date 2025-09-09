@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - WEBAPP_URL=${WEBAPP_URL:-http://webapp:8000}
+    restart: always
+    depends_on:
+      - webapp
+    networks:
+      - internal
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  webapp:
+    build:
+      context: ./webapp
+      dockerfile: Dockerfile
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_TOKEN}
+      - PORT=${WEBAPP_PORT:-8000}
+    restart: always
+    networks:
+      - internal
+      - coolify
+    labels:
+      - "coolify.managed=true"
+      - "coolify.type=application"
+      - "coolify.port=${WEBAPP_PORT:-8000}"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  internal:
+    driver: bridge
+  coolify:
+    external: true
