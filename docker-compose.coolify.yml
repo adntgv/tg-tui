@@ -23,9 +23,12 @@ services:
     build:
       context: ./webapp
       dockerfile: Dockerfile
+    expose:
+      - "8000"
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_TOKEN}
-      - PORT=${WEBAPP_PORT:-8000}
+      - PORT=8000
+      - WEBAPP_PORT=8000
     restart: always
     networks:
       - internal
@@ -33,7 +36,7 @@ services:
     labels:
       - "coolify.managed=true"
       - "coolify.type=application"
-      - "coolify.port=${WEBAPP_PORT:-8000}"
+      - "coolify.port=8000"
     logging:
       driver: "json-file"
       options:
