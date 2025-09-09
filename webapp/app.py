@@ -17,8 +17,8 @@ import subprocess
 from typing import Dict, Optional
 from dataclasses import dataclass
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request as FastAPIRequest
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
@@ -41,6 +41,19 @@ class TerminalSession:
     read_task: Optional[asyncio.Task] = None
 
 sessions: Dict[str, TerminalSession] = {}
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+
+@app.post("/webhook")
+async def webhook(request: FastAPIRequest):
+    """Telegram webhook endpoint - forwards to bot"""
+    # This is just a placeholder - the actual bot handles webhooks
+    return JSONResponse({"ok": True})
 
 
 @app.get("/")
@@ -223,9 +236,10 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     # Run server
+    port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8080,
+        port=port,
         log_level="info"
     )
