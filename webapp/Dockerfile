@@ -6,6 +6,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     bash \
     openssh-client \
+    sshpass \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install requirements first for better caching

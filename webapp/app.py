@@ -153,7 +153,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             stderr=slave_fd,
             cwd=DEFAULT_CWD,
             preexec_fn=os.setsid,
-            env=os.environ.copy()
+            env={**os.environ.copy(), "TERM": "xterm-256color"}
         )
         session.process = process
         
@@ -170,7 +170,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             print("Starting output reader task")
             loop = asyncio.get_event_loop()
             
-            while process.poll() is None:  # While process is running
+            while process and process.poll() is None:  # While process is running
                 try:
                     # Check if data is available to read
                     r, _, _ = select.select([master_fd], [], [], 0.01)
@@ -227,7 +227,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     
                     # Send SIGWINCH to process
                     if process and process.pid:
-                        os.kill(process.pid, signal.SIGWINCH)
+                        try:
+                            os.kill(process.pid, signal.SIGWINCH)
+                        except ProcessLookupError:
+                            print(f"Process {process.pid} not found for SIGWINCH")
                         
             except WebSocketDisconnect:
                 print("WebSocket disconnected")
@@ -326,8 +329,21 @@ async def websocket_session_endpoint(websocket: WebSocket, session_id: str):
         conn_mgr = ConnectionManager(db, encryption)
         credentials = conn_mgr.get_connection_credentials(active_session.user_id, connection.name)
         
-        # Create SSH command
-        ssh_args, temp_key_file = create_ssh_command(connection, credentials)
+        print(f"Retrieved credentials for {connection.name}:")
+        print(f"  Auth type: {connection.auth_type}")
+        print(f"  Has password: {bool(credentials.get('password'))}")
+        if credentials.get('password'):
+            # Don't log actual password, just length
+            print(f"  Password length: {len(credentials['password'])}")
+        
+        # Create SSH command - if password auth, use sshpass
+        if connection.auth_type == 'password' and credentials.get('password'):
+            ssh_base_args, temp_key_file = create_ssh_command(connection, credentials)
+            # Use sshpass to provide password
+            ssh_args = ['sshpass', '-p', credentials['password']] + ssh_base_args
+            print(f"Using sshpass for password authentication")
+        else:
+            ssh_args, temp_key_file = create_ssh_command(connection, credentials)
         session.temp_key_file = temp_key_file
         
         # Create PTY
@@ -341,25 +357,36 @@ async def websocket_session_endpoint(websocket: WebSocket, session_id: str):
         fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         
         # Start SSH process
-        process = subprocess.Popen(
-            ssh_args,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            preexec_fn=os.setsid,
-            env=os.environ.copy()
-        )
-        session.process = process
-        
-        print(f"Started SSH process: PID={process.pid}, Command: {' '.join(ssh_args)}")
+        try:
+            process = subprocess.Popen(
+                ssh_args,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                preexec_fn=os.setsid,
+                env={**os.environ.copy(), "TERM": "xterm-256color"}
+            )
+            session.process = process
+            
+            print(f"Started SSH process: PID={process.pid}, Command: {' '.join(ssh_args)}")
+            
+            # Check if process started successfully
+            import time
+            time.sleep(0.1)
+            if process.poll() is not None:
+                print(f"SSH process died immediately with code: {process.returncode}")
+                raise RuntimeError(f"SSH process failed with code {process.returncode}")
+        except Exception as e:
+            print(f"Failed to start SSH process: {e}")
+            raise
         
         # Close slave FD in parent
         os.close(slave_fd)
         slave_fd = None
         
-        # Handle authentication if needed
-        if connection.auth_type in ['password', 'key']:
-            handle_ssh_authentication(master_fd, connection, credentials)
+        # No need for manual authentication with sshpass
+        # The password is handled by sshpass for password auth
+        # For key auth, the key file is specified in the SSH command
         
         # Update session activity in database
         db.update_session_activity(session_id)
@@ -370,7 +397,7 @@ async def websocket_session_endpoint(websocket: WebSocket, session_id: str):
             print("Starting SSH output reader task")
             loop = asyncio.get_event_loop()
             
-            while process.poll() is None:  # While process is running
+            while process and process.poll() is None:  # While process is running
                 try:
                     # Check if data is available to read
                     r, _, _ = select.select([master_fd], [], [], 0.01)
@@ -420,7 +447,10 @@ async def websocket_session_endpoint(websocket: WebSocket, session_id: str):
                     
                     # Send SIGWINCH to process
                     if process and process.pid:
-                        os.kill(process.pid, signal.SIGWINCH)
+                        try:
+                            os.kill(process.pid, signal.SIGWINCH)
+                        except ProcessLookupError:
+                            print(f"Process {process.pid} not found for SIGWINCH")
                         
             except WebSocketDisconnect:
                 print("SSH WebSocket disconnected")

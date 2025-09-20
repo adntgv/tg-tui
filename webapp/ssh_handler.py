@@ -14,10 +14,14 @@ def create_ssh_command(connection, credentials=None):
     """Create SSH command from connection details"""
     ssh_args = [
         "ssh",
+        "-t",  # Force pseudo-terminal allocation for proper terminal support
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "ServerAliveInterval=60",
+        "-o", "PreferredAuthentications=password,keyboard-interactive",
+        "-o", "PubkeyAuthentication=no",
         "-p", str(connection.port),
-        f"{connection.username}@{connection.host}"
+        f"{connection.username}@{connection.host}",
+        "export TERM=xterm-256color && /bin/bash -l"  # Set terminal type and start login shell
     ]
     
     temp_key_file = None
@@ -44,6 +48,8 @@ def handle_ssh_authentication(master_fd, connection, credentials):
     import select
     import time
     
+    print(f"Starting authentication handler for {connection.username}@{connection.host}")
+    
     # Wait for initial output
     time.sleep(0.5)
     
@@ -51,18 +57,33 @@ def handle_ssh_authentication(master_fd, connection, credentials):
     r, _, _ = select.select([master_fd], [], [], 5)
     if r:
         output = os.read(master_fd, 4096)
-        output_str = output.decode('utf-8', errors='replace').lower()
+        output_str = output.decode('utf-8', errors='replace')
+        print(f"SSH prompt received: {repr(output_str)}")
         
-        if 'password:' in output_str and connection.auth_type == 'password':
+        output_lower = output_str.lower()
+        
+        if 'password:' in output_lower and connection.auth_type == 'password':
             if credentials and credentials.get('password'):
                 password = credentials['password'] + '\n'
-                os.write(master_fd, password.encode())
+                print(f"Sending password for {connection.username}")
+                written = os.write(master_fd, password.encode())
+                print(f"Wrote {written} bytes for password")
+                
+                # Wait a bit and check for response
+                time.sleep(0.5)
+                r, _, _ = select.select([master_fd], [], [], 2)
+                if r:
+                    response = os.read(master_fd, 4096)
+                    print(f"Post-auth response: {repr(response.decode('utf-8', errors='replace'))}")
+                
                 return True
-        elif 'passphrase' in output_str and connection.auth_type == 'key':
+        elif 'passphrase' in output_lower and connection.auth_type == 'key':
             if credentials and credentials.get('key_passphrase'):
                 passphrase = credentials['key_passphrase'] + '\n'
                 os.write(master_fd, passphrase.encode())
                 return True
+    else:
+        print("No prompt received within timeout")
     
     return False
 
