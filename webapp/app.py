@@ -22,7 +22,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request as FastAPIRequest, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
-# from fastapi.staticfiles import StaticFiles  # Not used currently
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 import uvicorn
@@ -56,6 +56,16 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize templates: {e}")
     templates = None
+
+# Mount static files directory
+try:
+    static_dir = Path("static")
+    if not static_dir.exists():
+        static_dir.mkdir()
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+    logger.info(f"Static files mounted from: {static_dir.absolute()}")
+except Exception as e:
+    logger.error(f"Failed to mount static files: {e}")
 
 # Track active sessions
 @dataclass
@@ -215,6 +225,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
                     written = os.write(master_fd, input_data.encode())
                     print(f"Wrote {written} bytes to PTY")
                     
+                elif data['type'] == 'ping':
+                    # Respond to heartbeat ping
+                    await websocket.send_text('pong')
+
                 elif data['type'] == 'resize':
                     # Resize PTY
                     cols = data.get('cols', 80)
@@ -436,11 +450,15 @@ async def websocket_session_endpoint(websocket: WebSocket, session_id: str):
                     input_data = data['data']
                     os.write(master_fd, input_data.encode())
                     
+                elif data['type'] == 'ping':
+                    # Respond to heartbeat ping
+                    await websocket.send_text('pong')
+
                 elif data['type'] == 'resize':
                     # Resize PTY
                     cols = data.get('cols', 80)
                     rows = data.get('rows', 24)
-                    
+
                     # Set terminal size
                     winsize = struct.pack('HHHH', rows, cols, 0, 0)
                     fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsize)

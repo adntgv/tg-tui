@@ -13,6 +13,9 @@
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.js"></script>
+
+    <!-- Reconnecting WebSocket for persistent connections -->
+    <script src="/static/reconnecting-websocket.js"></script>
     
     <style>
         * {
@@ -85,16 +88,33 @@
             border-radius: 5px;
             font-size: 12px;
             display: none;
+            cursor: pointer;
+            transition: opacity 0.2s;
         }
-        
+
+        #status:hover {
+            opacity: 0.8;
+        }
+
         #status.connected {
             display: block;
             background: rgba(0, 128, 0, 0.5);
         }
-        
+
         #status.disconnected {
             display: block;
             background: rgba(255, 0, 0, 0.5);
+        }
+
+        #status.reconnecting {
+            display: block;
+            background: rgba(255, 165, 0, 0.5);
+            cursor: not-allowed;
+        }
+
+        .reconnect-info {
+            font-size: 10px;
+            opacity: 0.8;
         }
         
         .keyboard-section {
@@ -102,6 +122,22 @@
             gap: 3px;
             width: 100%;
             justify-content: center;
+        }
+
+        #reconnect-btn {
+            display: none;
+            background: var(--tg-theme-destructive-text-color, #ff3b30);
+            animation: pulse 2s infinite;
+        }
+
+        #reconnect-btn.visible {
+            display: inline-block;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
         }
         
         #keyboard-toggle {
@@ -133,6 +169,9 @@
     <div id="terminal-container">
         <div id="terminal"></div>
         <div id="toolbar">
+            <!-- Reconnect button (shown when disconnected) -->
+            <button id="reconnect-btn" class="toolbar-btn">🔌 Reconnect</button>
+
             <!-- Arrow keys -->
             <div class="keyboard-section">
                 <button class="toolbar-btn small" data-key="ArrowUp">↑</button>
@@ -157,10 +196,17 @@
                 <button class="toolbar-btn small" data-key="Control+z">Ctrl+Z</button>
                 <button class="toolbar-btn small" data-key="Control+l">Ctrl+L</button>
             </div>
+
+            <!-- Number keys -->
+            <div class="keyboard-section">
+                <button class="toolbar-btn small" data-key="1">1</button>
+                <button class="toolbar-btn small" data-key="2">2</button>
+                <button class="toolbar-btn small" data-key="3">3</button>
+            </div>
         </div>
     </div>
     
-    <div id="status">Connecting...</div>
+    <div id="status" title="Click to reconnect">Connecting...</div>
     
     <!-- Keyboard toggle button -->
     <button id="keyboard-toggle" title="Toggle Keyboard">⌨️</button>
@@ -224,51 +270,200 @@
             wsUrl = `${protocol}//${window.location.host}/ws/${userId}`;
             console.log('Connecting to local terminal for user:', userId);
         }
-        const ws = new WebSocket(wsUrl);
+        // Create reconnecting WebSocket with exponential backoff
+        let ws;
+        let reconnectCount = 0;
+        let lastActivity = Date.now();
+        let heartbeatInterval;
+        let terminalBuffer = [];
+        const MAX_BUFFER_SIZE = 1000; // Keep last 1000 lines
+
+        // Initialize reconnecting WebSocket
+        ws = new ReconnectingWebSocket(wsUrl, null, {
+            reconnectInterval: 1000,        // Start with 1 second
+            maxReconnectInterval: 30000,    // Max 30 seconds
+            reconnectDecay: 1.5,            // Exponential backoff
+            timeoutInterval: 5000,          // Connection timeout
+            maxReconnectAttempts: null      // Infinite retries
+        });
         
+        // Handle connection events
+        ws.onconnecting = (isReconnect) => {
+            if (isReconnect) {
+                reconnectCount++;
+                const statusEl = document.getElementById('status');
+                statusEl.className = 'reconnecting';
+                statusEl.innerHTML = `Reconnecting... <span class="reconnect-info">(Attempt ${reconnectCount})</span>`;
+                statusEl.title = 'Connection in progress...';
+
+                // Hide reconnect button during reconnection
+                document.getElementById('reconnect-btn').classList.remove('visible');
+
+                term.write('\r\n\x1b[33mReconnecting...\x1b[0m\r\n');
+            }
+        };
+
+        ws.onreconnect = () => {
+            term.write('\r\n\x1b[32mConnection restored!\x1b[0m\r\n');
+            // Restore terminal buffer if available
+            if (terminalBuffer.length > 0) {
+                term.write('\x1b[2J\x1b[H'); // Clear and reset cursor
+                terminalBuffer.forEach(line => term.write(line));
+            }
+        };
+
         ws.onopen = () => {
-            document.getElementById('status').className = 'connected';
-            document.getElementById('status').textContent = 'Connected';
-            
+            reconnectCount = 0;
+            const statusEl = document.getElementById('status');
+            statusEl.className = 'connected';
+            statusEl.textContent = 'Connected';
+            statusEl.title = 'Connection active';
+
+            // Hide reconnect button
+            document.getElementById('reconnect-btn').classList.remove('visible');
+
             // Send initial size
             ws.send(JSON.stringify({
                 type: 'resize',
                 cols: term.cols,
                 rows: term.rows
             }));
+
+            // Start heartbeat
+            startHeartbeat();
         };
         
         ws.onmessage = (event) => {
+            lastActivity = Date.now();
+
             // Handle binary data from server
             if (event.data instanceof Blob) {
                 event.data.text().then(text => {
                     term.write(text);
+                    bufferTerminalOutput(text);
                 });
             } else {
+                // Check for pong response
+                if (event.data === 'pong') {
+                    return;
+                }
                 term.write(event.data);
+                bufferTerminalOutput(event.data);
             }
         };
         
         ws.onclose = () => {
-            document.getElementById('status').className = 'disconnected';
-            document.getElementById('status').textContent = 'Disconnected';
-            term.write('\r\n\x1b[31mConnection closed\x1b[0m\r\n');
+            stopHeartbeat();
+            const statusEl = document.getElementById('status');
+            statusEl.className = 'disconnected';
+            statusEl.textContent = 'Disconnected (Click to reconnect)';
+            statusEl.title = 'Click to reconnect';
+
+            // Show reconnect button
+            document.getElementById('reconnect-btn').classList.add('visible');
+
+            if (ws.forcedClose) {
+                term.write('\r\n\x1b[31mConnection closed\x1b[0m\r\n');
+            } else {
+                term.write('\r\n\x1b[33mConnection lost, attempting to reconnect...\x1b[0m\r\n');
+            }
         };
         
         ws.onerror = (error) => {
-            document.getElementById('status').className = 'disconnected';
-            document.getElementById('status').textContent = 'Error';
+            const statusEl = document.getElementById('status');
+            statusEl.className = 'disconnected';
+            statusEl.textContent = 'Error (Click to reconnect)';
+            statusEl.title = 'Click to reconnect';
+
+            // Show reconnect button
+            document.getElementById('reconnect-btn').classList.add('visible');
+
             console.error('WebSocket error:', error);
         };
         
         // Handle terminal input
         term.onData((data) => {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    type: 'input',
-                    data: data
-                }));
+            // ReconnectingWebSocket will queue messages if disconnected
+            ws.send(JSON.stringify({
+                type: 'input',
+                data: data
+            }));
+        });
+
+        // Buffer terminal output for restoration
+        function bufferTerminalOutput(data) {
+            terminalBuffer.push(data);
+            // Keep buffer size limited
+            if (terminalBuffer.length > MAX_BUFFER_SIZE) {
+                terminalBuffer.shift();
             }
+            // Store in sessionStorage for page reload recovery
+            try {
+                sessionStorage.setItem('terminal_buffer', JSON.stringify(terminalBuffer.slice(-100)));
+            } catch (e) {
+                // Ignore storage errors
+            }
+        }
+
+        // Heartbeat mechanism to detect stale connections
+        function startHeartbeat() {
+            stopHeartbeat();
+            heartbeatInterval = setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    // Send ping
+                    ws.send(JSON.stringify({ type: 'ping' }));
+
+                    // Check for stale connection
+                    if (Date.now() - lastActivity > 60000) { // 60 seconds without activity
+                        console.log('Connection appears stale, forcing reconnect');
+                        ws.refresh();
+                    }
+                }
+            }, 30000); // Ping every 30 seconds
+        }
+
+        function stopHeartbeat() {
+            if (heartbeatInterval) {
+                clearInterval(heartbeatInterval);
+                heartbeatInterval = null;
+            }
+        }
+
+        // Restore buffer from session storage if available
+        try {
+            const savedBuffer = sessionStorage.getItem('terminal_buffer');
+            if (savedBuffer) {
+                terminalBuffer = JSON.parse(savedBuffer);
+                console.log('Restored terminal buffer from session storage');
+            }
+        } catch (e) {
+            // Ignore storage errors
+        }
+
+        // Handle status click for manual reconnection
+        document.getElementById('status').addEventListener('click', () => {
+            const statusEl = document.getElementById('status');
+            // Only allow manual reconnect when disconnected (not when already reconnecting)
+            if (statusEl.className === 'disconnected') {
+                console.log('Manual reconnection triggered via status');
+                term.write('\r\n\x1b[36mManual reconnection initiated...\x1b[0m\r\n');
+                // Reset reconnect attempts to start fresh
+                ws.reconnectAttempts = 0;
+                // Trigger immediate reconnection
+                ws.open(true);
+            }
+        });
+
+        // Handle reconnect button click
+        document.getElementById('reconnect-btn').addEventListener('click', () => {
+            console.log('Manual reconnection triggered via button');
+            term.write('\r\n\x1b[36mManual reconnection initiated...\x1b[0m\r\n');
+            // Reset reconnect attempts to start fresh
+            ws.reconnectAttempts = 0;
+            // Hide button immediately
+            document.getElementById('reconnect-btn').classList.remove('visible');
+            // Trigger immediate reconnection
+            ws.open(true);
         });
         
         // Handle toolbar buttons
@@ -292,11 +487,15 @@
                     'Control+d': '\x04',
                     'Control+z': '\x1a',
                     'Control+l': '\x0c',
+                    '1': '1',
+                    '2': '2',
+                    '3': '3',
                 };
                 
                 data = keyMap[key] || '';
                 
-                if (data && ws.readyState === WebSocket.OPEN) {
+                if (data) {
+                    // ReconnectingWebSocket will queue if disconnected
                     ws.send(JSON.stringify({
                         type: 'input',
                         data: data
@@ -333,7 +532,7 @@
             // Resize terminal to use new available space
             setTimeout(() => {
                 fitAddon.fit();
-                if (ws && ws.readyState === WebSocket.OPEN) {
+                if (ws) {
                     ws.send(JSON.stringify({
                         type: 'resize',
                         cols: term.cols,
