@@ -119,3 +119,119 @@ class KeyboardBuilder:
         """Build cancel-only keyboard"""
         keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_operation")]]
         return InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
+    def tui_navigation() -> InlineKeyboardMarkup:
+        """Build TUI navigation keyboard"""
+        keyboard = [
+            [
+                InlineKeyboardButton("Home", callback_data="key:home"),
+                InlineKeyboardButton("↑", callback_data="key:up"),
+                InlineKeyboardButton("PgUp", callback_data="key:pgup"),
+            ],
+            [
+                InlineKeyboardButton("←", callback_data="key:left"),
+                InlineKeyboardButton("↓", callback_data="key:down"),
+                InlineKeyboardButton("→", callback_data="key:right"),
+            ],
+            [
+                InlineKeyboardButton("Tab →", callback_data="key:tab"),
+                InlineKeyboardButton("⇧Tab ←", callback_data="key:shift+tab"),
+                InlineKeyboardButton("Enter ⏎", callback_data="key:enter"),
+            ],
+            [
+                InlineKeyboardButton("End", callback_data="key:end"),
+                InlineKeyboardButton("PgDn", callback_data="key:pgdn"),
+                InlineKeyboardButton("Esc", callback_data="key:esc"),
+            ],
+            [
+                InlineKeyboardButton("🎛️ Ctrl", callback_data="kbd:ctrl"),
+                InlineKeyboardButton("⚡ Special", callback_data="kbd:special"),
+                InlineKeyboardButton("🔧 F-Keys", callback_data="kbd:function"),
+            ],
+            [
+                InlineKeyboardButton("🔌 Disconnect", callback_data="session_disconnect"),
+                InlineKeyboardButton("🌐 Web Terminal", callback_data="webapp:launch"),
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
+    def tui_ctrl() -> InlineKeyboardMarkup:
+        """Build Ctrl key combinations keyboard"""
+        keyboard = [
+            [
+                InlineKeyboardButton("^A", callback_data="key:ctrl+a"),
+                InlineKeyboardButton("^B", callback_data="key:ctrl+b"),
+                InlineKeyboardButton("^C", callback_data="key:ctrl+c"),
+            ],
+            [
+                InlineKeyboardButton("^D", callback_data="key:ctrl+d"),
+                InlineKeyboardButton("^E", callback_data="key:ctrl+e"),
+                InlineKeyboardButton("^F", callback_data="key:ctrl+f"),
+            ],
+            [
+                InlineKeyboardButton("^K", callback_data="key:ctrl+k"),
+                InlineKeyboardButton("^L", callback_data="key:ctrl+l"),
+                InlineKeyboardButton("^R", callback_data="key:ctrl+r"),
+            ],
+            [
+                InlineKeyboardButton("^U", callback_data="key:ctrl+u"),
+                InlineKeyboardButton("^W", callback_data="key:ctrl+w"),
+                InlineKeyboardButton("^Z", callback_data="key:ctrl+z"),
+            ],
+            [
+                InlineKeyboardButton("🔙 Back", callback_data="kbd:navigation"),
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
+    def tui_special() -> InlineKeyboardMarkup:
+        """Build special keys keyboard"""
+        keyboard = [
+            [
+                InlineKeyboardButton("Enter ⏎", callback_data="key:enter"),
+                InlineKeyboardButton("Space", callback_data="key:space"),
+                InlineKeyboardButton("Esc", callback_data="key:esc"),
+            ],
+            [
+                InlineKeyboardButton("Backspace ⌫", callback_data="key:backspace"),
+                InlineKeyboardButton("Delete", callback_data="key:delete"),
+            ],
+            [
+                InlineKeyboardButton("🔙 Back", callback_data="kbd:navigation"),
+            ],
+            [
+                InlineKeyboardButton("🌐 Web Terminal", callback_data="webapp:launch"),
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    @staticmethod
+    def tui_function() -> InlineKeyboardMarkup:
+        """Build function keys keyboard"""
+        keyboard = [
+            [
+                InlineKeyboardButton("F1", callback_data="key:f1"),
+                InlineKeyboardButton("F2", callback_data="key:f2"),
+                InlineKeyboardButton("F3", callback_data="key:f3"),
+                InlineKeyboardButton("F4", callback_data="key:f4"),
+            ],
+            [
+                InlineKeyboardButton("F5", callback_data="key:f5"),
+                InlineKeyboardButton("F6", callback_data="key:f6"),
+                InlineKeyboardButton("F7", callback_data="key:f7"),
+                InlineKeyboardButton("F8", callback_data="key:f8"),
+            ],
+            [
+                InlineKeyboardButton("F9", callback_data="key:f9"),
+                InlineKeyboardButton("F10", callback_data="key:f10"),
+                InlineKeyboardButton("F11", callback_data="key:f11"),
+                InlineKeyboardButton("F12", callback_data="key:f12"),
+            ],
+            [
+                InlineKeyboardButton("🔙 Back", callback_data="kbd:navigation"),
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)

@@ -21,6 +21,7 @@ import os
 import logging
 import textwrap
 import io
+import re
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -596,7 +597,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'home': '\x1b[H', 'end': '\x1b[F',
                 'pgup': '\x1b[5~', 'pgdn': '\x1b[6~',
                 'tab': '\t', 'shift+tab': '\x1b[Z',
-                'enter': '\n', 'esc': '\x1b',
+                'enter': '\r', 'esc': '\x1b',
                 'backspace': '\x7f', 'delete': '\x1b[3~',
                 'space': ' ',
                 'ctrl+a': '\x01', 'ctrl+b': '\x02', 'ctrl+c': '\x03',
@@ -681,13 +682,49 @@ async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     
     buffer = ""
     last_send_time = asyncio.get_event_loop().time()
-    min_interval = 2.0  # Minimum seconds between messages to avoid rate limits
+    min_interval = 1.0  # Reduced interval for more responsive output
+    last_message_id = None  # Track the last output message
+    keyboard_message_id = None  # Track the keyboard message
+    accumulated_output = ""  # Keep all output for editing
+    
+    # Send initial keyboard
+    try:
+        keyboard_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text="🖥️ **Terminal Controls**",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard_builder.session_actions()
+        )
+        keyboard_message_id = keyboard_msg.message_id
+    except:
+        pass
     
     while session and session.is_alive():
         try:
             # Check for output
             output = session.child.read_nonblocking(size=4096, timeout=0)
             if output:
+                # Filter out common ANSI escape sequences and control codes
+                # Note: Complex TUI apps like tmux/vim work better in web terminal
+                original_output = output
+                
+                # Comprehensive ANSI filtering
+                # Remove all CSI sequences (the most common ANSI escape sequences)
+                output = re.sub(r'\x1b\[[^m]*m', '', output)  # Remove all SGR sequences
+                output = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', output)  # Remove all CSI sequences
+                output = re.sub(r'\x1b\].*?\x07', '', output)  # OSC sequences (window title, etc)
+                output = re.sub(r'\x1b[PX^_].*?\x1b\\', '', output)  # DCS/SOS/PM/APC sequences
+                output = re.sub(r'\x1b\[[\?!][0-9;]*[a-zA-Z]', '', output)  # Private sequences
+                output = re.sub(r'\x1b[NO]', '', output)  # SS2/SS3
+                output = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]', '', output)  # Control chars except \t, \n, \r
+                
+                # Detect if this looks like a TUI app (lots of escape codes)
+                escape_ratio = len(original_output) - len(output)
+                if escape_ratio > len(output) * 0.5 and not hasattr(session, 'tui_warning_shown'):
+                    # Suggest web terminal for better experience (only once per session)
+                    buffer += "\n💡 Tip: Complex TUI apps work better in the web terminal. Use /webapp command.\n"
+                    session.tui_warning_shown = True
+                
                 buffer += output
                 
                 # Send if buffer is large enough or enough time has passed
@@ -695,44 +732,83 @@ async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 time_since_last = current_time - last_send_time
                 
                 # Only send if we have waited long enough and have content
-                if buffer and (len(buffer) > 3000 or time_since_last > min_interval):
-                    # If output is too long, send as file instead of multiple messages
-                    if len(buffer) > config.TG_MESSAGE_LIMIT:
-                        # Create a file-like object with the output
-                        output_file = io.BytesIO(buffer.encode('utf-8'))
-                        output_file.name = "terminal_output.txt"
-                        output_file.seek(0)
-                        
-                        try:
-                            # Send the file
-                            await context.bot.send_document(
-                                chat_id=chat_id,
-                                document=output_file,
-                                caption="📄 Terminal output (too long for messages)",
-                                filename=f"terminal_output_{datetime.now().strftime('%H%M%S')}.txt"
-                            )
-                        except Exception as e:
-                            # Fallback to sending first part as message if file fails
-                            chunk = buffer[:config.TG_MESSAGE_LIMIT]
+                # Also send immediately if buffer ends with common prompt patterns
+                prompt_patterns = ['\n$ ', '\n# ', '\n> ', '$ ', '# ', '> ']
+                has_prompt = any(buffer.endswith(p) for p in prompt_patterns)
+                
+                if buffer and (len(buffer) > 3000 or time_since_last > min_interval or has_prompt):
+                    # Add to accumulated output
+                    accumulated_output += buffer
+                    
+                    # Keep only last N characters to avoid message getting too long
+                    max_display = 3500
+                    if len(accumulated_output) > max_display:
+                        # Keep the last portion and add ellipsis
+                        accumulated_output = "...\n" + accumulated_output[-max_display:]
+                    
+                    # Format the message
+                    display_text = f"```\n{accumulated_output}\n```"
+                    
+                    try:
+                        if last_message_id:
+                            # Try to edit existing message
                             try:
-                                await context.bot.send_message(
+                                await context.bot.edit_message_text(
                                     chat_id=chat_id,
-                                    text=f"```\n{chunk}\n```\n⚠️ Output truncated (too long)",
+                                    message_id=last_message_id,
+                                    text=display_text,
                                     parse_mode=ParseMode.MARKDOWN
                                 )
-                            except:
-                                await context.bot.send_message(chat_id=chat_id, text=chunk)
-                    else:
-                        # Send as regular message if it fits
-                        try:
-                            await context.bot.send_message(
+                            except Exception as e:
+                                # If edit fails, send new message
+                                if "message is not modified" not in str(e).lower():
+                                    msg = await context.bot.send_message(
+                                        chat_id=chat_id,
+                                        text=display_text,
+                                        parse_mode=ParseMode.MARKDOWN
+                                    )
+                                    last_message_id = msg.message_id
+                        else:
+                            # First message - send new
+                            msg = await context.bot.send_message(
                                 chat_id=chat_id,
-                                text=f"```\n{buffer}\n```",
+                                text=display_text,
                                 parse_mode=ParseMode.MARKDOWN
                             )
-                        except:
-                            # Try without markdown if it fails
-                            await context.bot.send_message(chat_id=chat_id, text=buffer)
+                            last_message_id = msg.message_id
+                        
+                        # Move keyboard to bottom if needed
+                        if keyboard_message_id:
+                            try:
+                                await context.bot.delete_message(chat_id=chat_id, message_id=keyboard_message_id)
+                                keyboard_msg = await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text="🖥️ **Terminal Controls**",
+                                    parse_mode=ParseMode.MARKDOWN,
+                                    reply_markup=keyboard_builder.session_actions()
+                                )
+                                keyboard_message_id = keyboard_msg.message_id
+                            except:
+                                pass
+                    except Exception as e:
+                        # If accumulated output is too long, save as file
+                        if len(accumulated_output) > config.TG_MESSAGE_LIMIT:
+                            output_file = io.BytesIO(accumulated_output.encode('utf-8'))
+                            output_file.name = "terminal_output.txt"
+                            output_file.seek(0)
+                            
+                            try:
+                                await context.bot.send_document(
+                                    chat_id=chat_id,
+                                    document=output_file,
+                                    caption="📄 Terminal output (saved to file)",
+                                    filename=f"terminal_output_{datetime.now().strftime('%H%M%S')}.txt"
+                                )
+                                # Clear accumulated output after saving to file
+                                accumulated_output = ""
+                                last_message_id = None
+                            except:
+                                pass
                     
                     buffer = ""
                     last_send_time = current_time
@@ -743,30 +819,30 @@ async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     
     # Send any remaining buffer
     if buffer:
-        if len(buffer) > config.TG_MESSAGE_LIMIT:
-            # Send as file
-            output_file = io.BytesIO(buffer.encode('utf-8'))
-            output_file.name = "terminal_output.txt"
-            output_file.seek(0)
-            
-            try:
-                await context.bot.send_document(
+        accumulated_output += buffer
+        try:
+            if last_message_id:
+                await context.bot.edit_message_text(
                     chat_id=chat_id,
-                    document=output_file,
-                    caption="📄 Final terminal output",
-                    filename=f"terminal_output_{datetime.now().strftime('%H%M%S')}.txt"
-                )
-            except:
-                pass
-        else:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"```\n{buffer}\n```",
+                    message_id=last_message_id,
+                    text=f"```\n{accumulated_output}\n```",
                     parse_mode=ParseMode.MARKDOWN
                 )
-            except:
-                await context.bot.send_message(chat_id=chat_id, text=buffer)
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"```\n{accumulated_output}\n```",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        except:
+            pass
+    
+    # Clean up keyboard
+    if keyboard_message_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=keyboard_message_id)
+        except:
+            pass
 
 # ------------------------- WEBAPP COMMAND -------------------------
 

@@ -1,1 +1,9 @@
 venv__pycache__/
+
+# Python
+*.pyc
+__pycache__/
+venv/
+.env
+*.db
+*.db-journal

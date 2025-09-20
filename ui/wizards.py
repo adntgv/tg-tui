@@ -36,13 +36,18 @@ class ConnectionWizard:
             last_name=user.last_name
         )
         
-        await update.message.reply_text(
-            "Let's add a new SSH connection!\n\n"
-            "Please enter a name for this connection (e.g., 'My VPS', 'Work Server'):"
-        )
-        
-        # Initialize user data
+        # Clear any existing conversation data
+        context.user_data.clear()
         context.user_data['connection'] = {}
+        context.user_data['in_wizard'] = True
+        
+        await update.message.reply_text(
+            "🆕 **Add New SSH Connection**\n\n"
+            "Let's set up a new connection step by step.\n"
+            "You can cancel anytime with /cancel\n\n"
+            "📝 **Step 1/6:** Enter a nickname for this connection\n"
+            "(e.g., 'My VPS', 'Work Server', 'Home PC'):"
+        )
         
         return NAME
     
@@ -250,7 +255,8 @@ class ConnectionWizard:
             )
         
         # Clear user data
-        context.user_data.clear()
+        context.user_data.pop('connection', None)
+        context.user_data.pop('in_wizard', None)
     
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel the wizard"""
@@ -261,7 +267,7 @@ class ConnectionWizard:
     def get_handler(self) -> ConversationHandler:
         """Get the conversation handler for this wizard"""
         return ConversationHandler(
-            entry_points=[CommandHandler('add_connection', self.start_add)],
+            entry_points=[CommandHandler('add', self.start_add)],
             states={
                 NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_name)],
                 HOST: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.get_host)],

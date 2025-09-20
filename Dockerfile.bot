@@ -2,15 +2,28 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Install system dependencies including openssh-client for SSH connections
 RUN apt-get update && apt-get install -y \
     bash \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy all necessary Python files and modules
 COPY main.py .
+COPY config.py .
+COPY database/ ./database/
+COPY security/ ./security/
+COPY ssh/ ./ssh/
+COPY ui/ ./ui/
+
+# Create directory for SQLite database
+RUN mkdir -p /app/data
 
 ENV PYTHONUNBUFFERED=1
+ENV DATABASE_URL=/app/data/ssh_connections.db
 
 CMD ["python", "main.py"]
