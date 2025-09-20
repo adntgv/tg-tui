@@ -446,6 +446,48 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard
         )
     
+    elif data == "menu_add":
+        await query.edit_message_text(
+            "To add a new SSH connection, use the /add command.\n"
+            "I'll guide you through the setup process step by step.\n\n"
+            "Type /add to start."
+        )
+        return
+    
+    elif data == "menu_quick":
+        await query.edit_message_text(
+            "**Quick Connect** (without saving)\n\n"
+            "Use: `/quick <host> [port] [username]`\n\n"
+            "Examples:\n"
+            "• `/quick example.com`\n"
+            "• `/quick 192.168.1.100 22 root`\n"
+            "• `/quick server.local 2222 admin`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    elif data == "menu_settings":
+        user_id = update.effective_user.id
+        user = db.get_user(user_id)
+        settings_text = f"""
+**⚙️ Settings**
+
+**User ID:** `{user_id}`
+**Registered:** {user.registered_at.strftime('%Y-%m-%d')}
+**Connections:** {len(db.get_connections(user_id))}
+
+**Features:**
+• Quick Connect: {'✅' if config.ALLOW_QUICK_CONNECT else '❌'}
+• Key Upload: {'✅' if config.ALLOW_KEY_UPLOAD else '❌'}
+• Multi-Sessions: {'✅' if config.ALLOW_MULTIPLE_SESSIONS else '❌'}
+        """
+        await query.edit_message_text(
+            settings_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard_builder.main_menu()
+        )
+        return
+    
     elif data == "menu_connect":
         connections = connection_mgr.list_connections(user_id)
         if not connections:
@@ -511,7 +553,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("No active connection.")
     
     elif data == "menu_help":
-        await help_cmd(update, context)
+        help_text = """
+**SSH Terminal Bot Commands**
+
+**Connection Management:**
+/add - Add new SSH connection
+/connections - List saved connections
+/connect <name> - Connect to saved server
+/delete <name> - Delete saved connection
+/setdefault <name> - Set default connection
+
+**Quick Actions:**
+/quick <host> [port] [user] - Quick connect (not saved)
+/disconnect - Close current SSH session
+/status - Show connection status
+
+**Other:**
+/help - Show this help
+/start - Show main menu
+        """
+        await query.edit_message_text(
+            help_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard_builder.main_menu()
+        )
 
 # ------------------------- OUTPUT STREAMING -------------------------
 

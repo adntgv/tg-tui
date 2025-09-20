@@ -6,7 +6,7 @@ import base64
 from typing import Optional
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 class EncryptionManager:
     def __init__(self, base_key: str = None):
@@ -21,7 +21,7 @@ class EncryptionManager:
         # Combine base key with user ID for unique key per user
         salt = f"telegram_ssh_{user_id}".encode()
         
-        kdf = PBKDF2(
+        kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
