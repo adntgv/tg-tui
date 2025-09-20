@@ -8,6 +8,10 @@ services:
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - WEBAPP_URL=${WEBAPP_URL}
+      - DATABASE_URL=sqlite:////app/data/ssh_connections.db
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+    volumes:
+      - bot-data:/app/data
     restart: always
     depends_on:
       - webapp
@@ -46,3 +50,6 @@ services:
 networks:
   tg-network:
     driver: bridge
+
+volumes:
+  bot-data:

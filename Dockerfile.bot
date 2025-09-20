@@ -24,6 +24,6 @@ COPY ui/ ./ui/
 RUN mkdir -p /app/data
 
 ENV PYTHONUNBUFFERED=1
-ENV DATABASE_URL=/app/data/ssh_connections.db
+ENV DATABASE_URL=sqlite:////app/data/ssh_connections.db
 
 CMD ["python", "main.py"]
