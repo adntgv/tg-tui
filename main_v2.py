@@ -20,6 +20,7 @@ import asyncio
 import os
 import logging
 import textwrap
+import io
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -173,13 +174,8 @@ Regular messages - Send with newline
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def add_connection_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /add command - Start connection wizard"""
-    if not await ensure_registered(update):
-        return
-    
-    wizard = ConnectionWizard(db, encryption)
-    await wizard.start_add(update, context)
+# Note: add_connection_cmd is no longer needed since the ConversationHandler 
+# in ConnectionWizard handles the /add command directly
 
 async def connections_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /connections command - List saved connections"""
@@ -552,6 +548,103 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("No active connection.")
     
+    elif data == "session_tui":
+        # Switch to TUI mode with control buttons
+        session = ssh_manager.get(chat_id)
+        if session:
+            keyboard = keyboard_builder.tui_navigation()
+            await query.edit_message_text(
+                "🖥️ **TUI Mode Active**\n\n"
+                "Use the buttons below to navigate.\n"
+                "Send text messages to type commands.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
+            )
+        else:
+            await query.edit_message_text("No active SSH connection.")
+    
+    elif data == "session_webapp" or data == "webapp:launch":
+        # Launch web terminal
+        if not config.WEBAPP_URL:
+            await query.edit_message_text(
+                "Web terminal is not configured.\n"
+                "Please set WEBAPP_URL in your environment."
+            )
+        else:
+            from telegram import WebAppInfo
+            webapp_url = f"{config.WEBAPP_URL}?user_id={user_id}"
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🌐 Open Web Terminal",
+                    web_app=WebAppInfo(url=webapp_url)
+                )
+            ]])
+            await query.edit_message_text(
+                "Click below to open the web terminal:",
+                reply_markup=keyboard
+            )
+    
+    elif data.startswith("key:"):
+        # Handle key presses
+        key = data[4:]  # Remove "key:" prefix
+        session = ssh_manager.get(chat_id)
+        if session and session.is_alive():
+            # Map special keys to terminal sequences
+            key_map = {
+                'up': '\x1b[A', 'down': '\x1b[B', 
+                'right': '\x1b[C', 'left': '\x1b[D',
+                'home': '\x1b[H', 'end': '\x1b[F',
+                'pgup': '\x1b[5~', 'pgdn': '\x1b[6~',
+                'tab': '\t', 'shift+tab': '\x1b[Z',
+                'enter': '\n', 'esc': '\x1b',
+                'backspace': '\x7f', 'delete': '\x1b[3~',
+                'space': ' ',
+                'ctrl+a': '\x01', 'ctrl+b': '\x02', 'ctrl+c': '\x03',
+                'ctrl+d': '\x04', 'ctrl+e': '\x05', 'ctrl+f': '\x06',
+                'ctrl+k': '\x0b', 'ctrl+l': '\x0c', 'ctrl+r': '\x12',
+                'ctrl+u': '\x15', 'ctrl+w': '\x17', 'ctrl+z': '\x1a',
+                'f1': '\x1bOP', 'f2': '\x1bOQ', 'f3': '\x1bOR', 'f4': '\x1bOS',
+                'f5': '\x1b[15~', 'f6': '\x1b[17~', 'f7': '\x1b[18~', 'f8': '\x1b[19~',
+                'f9': '\x1b[20~', 'f10': '\x1b[21~', 'f11': '\x1b[23~', 'f12': '\x1b[24~',
+            }
+            
+            if key in key_map:
+                session.child.send(key_map[key])
+                await query.answer(f"Sent: {key}")
+            else:
+                await query.answer(f"Unknown key: {key}")
+        else:
+            await query.answer("No active SSH connection", show_alert=True)
+    
+    elif data.startswith("kbd:"):
+        # Switch keyboard layouts
+        kbd_type = data[4:]  # Remove "kbd:" prefix
+        session = ssh_manager.get(chat_id)
+        if session:
+            if kbd_type == "navigation":
+                keyboard = keyboard_builder.tui_navigation()
+                text = "🖥️ **TUI Navigation Mode**"
+            elif kbd_type == "ctrl":
+                keyboard = keyboard_builder.tui_ctrl()
+                text = "🎛️ **Ctrl Key Combinations**"
+            elif kbd_type == "special":
+                keyboard = keyboard_builder.tui_special()
+                text = "⚡ **Special Keys**"
+            elif kbd_type == "function":
+                keyboard = keyboard_builder.tui_function()
+                text = "🔧 **Function Keys**"
+            else:
+                keyboard = keyboard_builder.tui_navigation()
+                text = "🖥️ **TUI Mode**"
+            
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
+            )
+        else:
+            await query.answer("No active SSH connection", show_alert=True)
+    
     elif data == "menu_help":
         help_text = """
 **SSH Terminal Bot Commands**
@@ -588,6 +681,7 @@ async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     
     buffer = ""
     last_send_time = asyncio.get_event_loop().time()
+    min_interval = 2.0  # Minimum seconds between messages to avoid rate limits
     
     while session and session.is_alive():
         try:
@@ -598,24 +692,47 @@ async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 
                 # Send if buffer is large enough or enough time has passed
                 current_time = asyncio.get_event_loop().time()
-                if len(buffer) > 3000 or (buffer and current_time - last_send_time > 1):
-                    # Split into chunks if needed
-                    chunks = [buffer[i:i+config.TG_MESSAGE_LIMIT] 
-                             for i in range(0, len(buffer), config.TG_MESSAGE_LIMIT)]
-                    
-                    for chunk in chunks:
+                time_since_last = current_time - last_send_time
+                
+                # Only send if we have waited long enough and have content
+                if buffer and (len(buffer) > 3000 or time_since_last > min_interval):
+                    # If output is too long, send as file instead of multiple messages
+                    if len(buffer) > config.TG_MESSAGE_LIMIT:
+                        # Create a file-like object with the output
+                        output_file = io.BytesIO(buffer.encode('utf-8'))
+                        output_file.name = "terminal_output.txt"
+                        output_file.seek(0)
+                        
+                        try:
+                            # Send the file
+                            await context.bot.send_document(
+                                chat_id=chat_id,
+                                document=output_file,
+                                caption="📄 Terminal output (too long for messages)",
+                                filename=f"terminal_output_{datetime.now().strftime('%H%M%S')}.txt"
+                            )
+                        except Exception as e:
+                            # Fallback to sending first part as message if file fails
+                            chunk = buffer[:config.TG_MESSAGE_LIMIT]
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"```\n{chunk}\n```\n⚠️ Output truncated (too long)",
+                                    parse_mode=ParseMode.MARKDOWN
+                                )
+                            except:
+                                await context.bot.send_message(chat_id=chat_id, text=chunk)
+                    else:
+                        # Send as regular message if it fits
                         try:
                             await context.bot.send_message(
                                 chat_id=chat_id,
-                                text=f"```\n{chunk}\n```",
+                                text=f"```\n{buffer}\n```",
                                 parse_mode=ParseMode.MARKDOWN
                             )
-                        except Exception as e:
+                        except:
                             # Try without markdown if it fails
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=chunk
-                            )
+                            await context.bot.send_message(chat_id=chat_id, text=buffer)
                     
                     buffer = ""
                     last_send_time = current_time
@@ -626,14 +743,30 @@ async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     
     # Send any remaining buffer
     if buffer:
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"```\n{buffer}\n```",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except:
-            await context.bot.send_message(chat_id=chat_id, text=buffer)
+        if len(buffer) > config.TG_MESSAGE_LIMIT:
+            # Send as file
+            output_file = io.BytesIO(buffer.encode('utf-8'))
+            output_file.name = "terminal_output.txt"
+            output_file.seek(0)
+            
+            try:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=output_file,
+                    caption="📄 Final terminal output",
+                    filename=f"terminal_output_{datetime.now().strftime('%H%M%S')}.txt"
+                )
+            except:
+                pass
+        else:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"```\n{buffer}\n```",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except:
+                await context.bot.send_message(chat_id=chat_id, text=buffer)
 
 # ------------------------- WEBAPP COMMAND -------------------------
 
@@ -670,10 +803,14 @@ def main():
     # Create application
     application = Application.builder().token(config.TELEGRAM_TOKEN).build()
     
+    # Add connection wizard FIRST (higher priority)
+    wizard = ConnectionWizard(db, encryption)
+    application.add_handler(wizard.get_handler())
+    
     # Add command handlers
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("add", add_connection_cmd))
+    # Note: /add is handled by the ConversationHandler wizard above
     application.add_handler(CommandHandler("connections", connections_cmd))
     application.add_handler(CommandHandler("connect", connect_cmd))
     application.add_handler(CommandHandler("quick", quick_connect_cmd))
@@ -683,18 +820,14 @@ def main():
     application.add_handler(CommandHandler("setdefault", setdefault_cmd))
     application.add_handler(CommandHandler("webapp", webapp_cmd))
     
-    # Add message handler
+    # Add callback handler
+    application.add_handler(CallbackQueryHandler(callback_handler))
+    
+    # Add message handler LAST (lowest priority)
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
         message_handler
     ))
-    
-    # Add callback handler
-    application.add_handler(CallbackQueryHandler(callback_handler))
-    
-    # Add connection wizard
-    wizard = ConnectionWizard(db, encryption)
-    application.add_handler(wizard.get_handler())
     
     # Start bot
     logger.info("Starting SSH Terminal Bot...")

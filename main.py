@@ -1,1028 +1,837 @@
+#!/usr/bin/env python3
 """
-SSH Terminal Telegram Bot
---------------------------------
-A Telegram bot that provides SSH terminal access to remote servers through multiple interfaces.
-Connect to your servers securely via Telegram with full PTY support.
+Multi-User SSH Terminal Telegram Bot
+-------------------------------------
+A Telegram bot that allows users to manage and connect to multiple SSH servers.
+Each user can save their own SSH connections with encrypted credentials.
 
-⚠️ SECURITY: This bot provides SSH access. Ensure proper access controls and use at your own risk.
+Features:
+- Save multiple SSH connections with encrypted passwords/keys
+- Connect to saved servers with one click
+- Full PTY support for interactive programs
+- TUI mode with keyboard navigation
+- Web terminal interface
+- Per-user isolation and security
 
-Requires: python-telegram-bot >= 21, pexpect
-
-pip install python-telegram-bot==21.6 pexpect
-
-Run with:  TELEGRAM_TOKEN=... python main.py
+Run with: python main_v2.py
 """
 
 import asyncio
 import os
+import logging
 import textwrap
-from dataclasses import dataclass, field
-from typing import Dict, Optional
+import io
+from typing import Optional
+from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
-import pexpect
-
-# ------------------------- CONFIG -------------------------
-# Allow only these Telegram user IDs to use the bot (REQUIRED!)
-AUTHORIZED_USER_IDS = {
-    # e.g. 123456789,
-    289310951
-}
-
-# SSH connection defaults
-DEFAULT_SSH_PORT = 22
-DEFAULT_SSH_USER = os.environ.get("USER", "root")
-
-# Telegram message size hard limit
-TG_LIMIT = 4096
-
-# How often to poll the PTY for output (seconds)
-POLL_INTERVAL = 0.2
-
-# ------------------------- STATE -------------------------
-@dataclass
-class SSHSession:
-    child: pexpect.spawn
-    host: str
-    port: int
-    username: str
-    buffer: str = ""
-    task: Optional[asyncio.Task] = None
-    connected: bool = False
-
-    def send(self, data: str):
-        self.child.send(data)
-
-    def is_alive(self) -> bool:
-        return self.child.isalive() and self.connected
-
-
-class SSHManager:
-    def __init__(self):
-        self.sessions: Dict[int, SSHSession] = {}
-
-    def get(self, chat_id: int) -> Optional[SSHSession]:
-        return self.sessions.get(chat_id)
-
-    def connect(self, chat_id: int, host: str, port: int = DEFAULT_SSH_PORT, username: str = DEFAULT_SSH_USER) -> SSHSession:
-        if chat_id in self.sessions and self.sessions[chat_id].is_alive():
-            raise RuntimeError("An SSH session is already active. Use /disconnect to close it.")
-        
-        # Build SSH command with options
-        ssh_cmd = f"ssh -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=60 -p {port} {username}@{host}"
-        
-        # Start SSH process via pexpect
-        child = pexpect.spawn(ssh_cmd, encoding="utf-8", timeout=30)
-        sess = SSHSession(child=child, host=host, port=port, username=username)
-        self.sessions[chat_id] = sess
-        
-        # Handle initial connection (password prompt or direct connection with key)
-        try:
-            index = child.expect([
-                "password:",  # Password prompt
-                "passphrase",  # SSH key passphrase
-                r"\$",  # Shell prompt (successful key auth)
-                r"#",   # Root shell prompt
-                r">",   # Another possible prompt
-                pexpect.EOF,
-                pexpect.TIMEOUT
-            ], timeout=10)
-            
-            if index in [0, 1]:  # Password or passphrase needed
-                sess.connected = False  # Will be set to True after auth
-            elif index in [2, 3, 4]:  # Connected successfully
-                sess.connected = True
-            else:
-                raise RuntimeError("SSH connection failed or timed out")
-                
-        except Exception as e:
-            child.close(force=True)
-            self.sessions.pop(chat_id, None)
-            raise RuntimeError(f"SSH connection failed: {str(e)}")
-        
-        return sess
-
-    def disconnect(self, chat_id: int):
-        sess = self.sessions.get(chat_id)
-        if not sess:
-            return
-        try:
-            if sess.child.isalive():
-                # Send exit command
-                try:
-                    sess.child.sendline("exit")
-                    sess.child.expect(pexpect.EOF, timeout=1)
-                except Exception:
-                    sess.child.close(force=True)
-        finally:
-            # Cancel output task if running
-            if sess.task and not sess.task.done():
-                sess.task.cancel()
-            self.sessions.pop(chat_id, None)
-
-
-ssh_manager = SSHManager()
-
-# ------------------------- HELPERS -------------------------
-async def send_chunked(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE):
-    # Telegram messages max ~4096 chars. Split on newline boundaries when possible.
-    if not text:
-        return
-    start = 0
-    while start < len(text):
-        end = min(start + TG_LIMIT, len(text))
-        # try to break at last newline
-        nl = text.rfind("\n", start, end)
-        if nl != -1 and nl > start:
-            piece = text[start:nl]
-            start = nl + 1
-        else:
-            piece = text[start:end]
-            start = end
-        await context.bot.send_message(chat_id=chat_id, text=f"```\n{piece}\n```", parse_mode=ParseMode.MARKDOWN_V2)
-
-
-def escape_markdown_v2(s: str) -> str:
-    # Minimal escaping for code blocks content handled separately
-    for ch in ("_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"):
-        s = s.replace(ch, f"\\{ch}")
-    return s
-
-
-async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    sess = ssh_manager.get(chat_id)
-    if not sess:
-        return
-    child = sess.child
-    # Continuously read whatever is available without blocking.
-    while True:
-        try:
-            await asyncio.sleep(POLL_INTERVAL)
-            if not child.isalive():
-                await context.bot.send_message(chat_id=chat_id, text=f"SSH connection to {sess.host} closed.")
-                ssh_manager.disconnect(chat_id)
-                return
-            # Use non-blocking read by checking child.before after expect with short timeout
-            if child.exitstatus is None:
-                # Read all available without waiting
-                try:
-                    data = child.read_nonblocking(size=4096, timeout=0)
-                except pexpect.exceptions.TIMEOUT:
-                    data = ""
-                except pexpect.exceptions.EOF:
-                    data = child.before or ""
-                if data:
-                    await send_chunked(chat_id, data, context)
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            await context.bot.send_message(chat_id=chat_id, text=f"Output loop error: {escape_markdown_v2(str(e))}")
-            return
-
-
-# ------------------------- COMMANDS -------------------------
-async def ensure_auth(update: Update) -> bool:
-    user = update.effective_user
-    return user and user.id in AUTHORIZED_USER_IDS
-
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_auth(update):
-        return await update.effective_message.reply_text("Unauthorized. Add your user id to AUTHORIZED_USER_IDS.")
-    m = textwrap.dedent(
-        f"""
-        Hi {update.effective_user.first_name or ''}!\n\n"""
-    ).strip()
-    await update.effective_message.reply_text(m + HELP_TEXT)
-
-
-HELP_TEXT = textwrap.dedent(
-    """
-
-Commands:
-  /ssh <host> [port] [user]  Connect to SSH server
-  /disconnect                Close current SSH connection
-  /status                    Show connection status
-  /tui start                 Start TUI mode with inline keyboard
-  /webapp                    Open full terminal web app
-  /send <text>               Send raw text (no newline) to SSH session
-  Type anything else         Sends the line to SSH session with newline
-
-Examples:
-  /ssh example.com
-  /ssh server.local 2222 admin
-  /ssh 192.168.1.100
-
-Notes:
-- Uses SSH keys from ~/.ssh/ for authentication
-- If no key is available, you'll be prompted for password
-- Full PTY support for interactive programs
-- Web app provides the best terminal experience!
-"""
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    MessageHandler, 
+    CallbackQueryHandler,
+    ContextTypes, 
+    filters
 )
 
+# Import our modules
+import config
+from database import DatabaseManager
+from security import EncryptionManager
+from ssh import EnhancedSSHManager, ConnectionManager
+from ui import KeyboardBuilder, ConnectionWizard
 
-async def ssh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_auth(update):
-        return await update.effective_message.reply_text("Unauthorized.")
-    
-    chat_id = update.effective_chat.id
-    args = update.effective_message.text.split()
-    
-    if len(args) < 2:
-        return await update.effective_message.reply_text(
-            "Usage: /ssh <host> [port] [username]\n"
-            "Example: /ssh example.com 22 root"
-        )
-    
-    host = args[1]
-    port = int(args[2]) if len(args) > 2 and args[2].isdigit() else DEFAULT_SSH_PORT
-    username = args[3] if len(args) > 3 else DEFAULT_SSH_USER
-    
-    await update.effective_message.reply_text(f"Connecting to {username}@{host}:{port}...")
-    
-    try:
-        sess = ssh_manager.connect(chat_id, host, port, username)
-        
-        # Check if password is needed
-        if not sess.connected:
-            await update.effective_message.reply_text(
-                "🔐 Authentication required. Please enter your password:\n"
-                "(Send it as a regular message)"
-            )
-        else:
-            await update.effective_message.reply_text(f"✅ Connected to {username}@{host}:{port}")
-        
-        # Start output streaming task
-        sess.task = asyncio.create_task(tail_output(chat_id, context))
-        
-    except RuntimeError as e:
-        return await update.effective_message.reply_text(f"❌ Connection failed: {str(e)}")
+# Import existing modules (TUI support)
+try:
+    import pyte
+    HAS_PYTE = True
+except ImportError:
+    HAS_PYTE = False
+    print("pyte not installed - TUI mode disabled")
 
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO if not config.DEBUG else logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-async def disconnect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_auth(update):
-        return await update.effective_message.reply_text("Unauthorized.")
-    chat_id = update.effective_chat.id
+# Initialize components
+db = DatabaseManager(config.DATABASE_URL)
+encryption = EncryptionManager(config.ENCRYPTION_KEY)
+ssh_manager = EnhancedSSHManager(db, encryption)
+connection_mgr = ConnectionManager(db, encryption)
+keyboard_builder = KeyboardBuilder()
+
+# ------------------------- HELPERS -------------------------
+
+def format_connection_info(conn: dict) -> str:
+    """Format connection information for display"""
+    info = f"**{conn['name']}**\n"
+    info += f"Host: {conn['username']}@{conn['host']}:{conn['port']}\n"
+    info += f"Auth: {conn['auth_type']}\n"
+    if conn.get('last_used'):
+        info += f"Last used: {conn['last_used']}"
+    return info
+
+def escape_markdown(text: str) -> str:
+    """Escape special characters for Markdown V2"""
+    chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in chars:
+        text = text.replace(char, f'\\{char}')
+    return text
+
+# ------------------------- AUTHENTICATION -------------------------
+
+async def ensure_registered(update: Update) -> bool:
+    """Ensure user is registered in the database"""
+    user = update.effective_user
+    if not user:
+        return False
     
-    # Stop TUI session if active
-    tui_sess = tui_sessions.get(chat_id)
-    if tui_sess:
-        tui_sess.stop()
-        tui_sessions.pop(chat_id, None)
-        await update.effective_message.reply_text("Disconnected from SSH (TUI mode).")
+    # Auto-register user
+    db.get_or_create_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name
+    )
+    return True
+
+# ------------------------- COMMAND HANDLERS -------------------------
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    if not await ensure_registered(update):
+        return await update.message.reply_text("Failed to register. Please try again.")
+    
+    user = update.effective_user
+    welcome_text = f"""
+🚀 **Welcome to SSH Terminal Bot, {user.first_name}!**
+
+This bot allows you to securely manage and connect to your SSH servers directly from Telegram.
+
+**Features:**
+• Save multiple SSH connections with encrypted credentials
+• Connect to any saved server with one click  
+• Full terminal emulation with PTY support
+• Interactive TUI mode with keyboard navigation
+• Web terminal for the best experience
+
+**Quick Start:**
+Use /add to save your first SSH connection
+Use /connections to see saved connections
+Use /help for all available commands
+
+Your data is encrypted and isolated from other users.
+    """
+    
+    keyboard = keyboard_builder.main_menu()
+    await update.message.reply_text(
+        welcome_text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /help command"""
+    help_text = """
+**SSH Terminal Bot Commands**
+
+**Connection Management:**
+/add - Add new SSH connection
+/connections - List saved connections
+/connect <name> - Connect to saved server
+/delete <name> - Delete saved connection
+/setdefault <name> - Set default connection
+
+**Quick Actions:**
+/quick <host> [port] [user] - Quick connect (not saved)
+/disconnect - Close current SSH session
+/status - Show connection status
+
+**Session Commands:**
+/send <text> - Send raw text to SSH session
+/tui - Start TUI mode (keyboard navigation)
+/webapp - Open web terminal
+Regular messages - Send with newline
+
+**Other:**
+/help - Show this help
+/about - About this bot
+/settings - Bot settings
+
+**Tips:**
+• Save frequently used servers with /add
+• Set a default connection for quick access
+• Use web terminal for the best experience
+• Your credentials are encrypted and secure
+    """
+    
+    await update.message.reply_text(
+        help_text,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# Note: add_connection_cmd is no longer needed since the ConversationHandler 
+# in ConnectionWizard handles the /add command directly
+
+async def connections_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /connections command - List saved connections"""
+    if not await ensure_registered(update):
         return
     
-    # Disconnect SSH session
-    sess = ssh_manager.get(chat_id)
-    if sess:
-        host = sess.host
-        ssh_manager.disconnect(chat_id)
-        await update.effective_message.reply_text(f"✅ Disconnected from {host}")
-    else:
-        await update.effective_message.reply_text("No active SSH connection.")
+    user_id = update.effective_user.id
+    connections = connection_mgr.list_connections(user_id)
+    
+    if not connections:
+        await update.message.reply_text(
+            "You don't have any saved connections yet.\n"
+            "Use /add to add your first connection!"
+        )
+        return
+    
+    # Build connection list message
+    message = "**Your SSH Connections:**\n\n"
+    for conn in connections:
+        if conn.get('is_default'):
+            message += "⭐ "
+        message += f"`{conn['name']}` - {conn['username']}@{conn['host']}:{conn['port']}\n"
+    
+    keyboard = keyboard_builder.connections_list(connections)
+    await update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard
+    )
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_auth(update):
-        return await update.effective_message.reply_text("Unauthorized.")
+async def connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /connect command - Connect to saved server"""
+    if not await ensure_registered(update):
+        return
+    
+    args = update.message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /connect <connection_name>\n"
+            "Use /connections to see available connections."
+        )
+        return
+    
+    connection_name = args[1]
+    await connect_to_server(update, context, connection_name)
+
+async def connect_to_server(update: Update, context: ContextTypes.DEFAULT_TYPE, connection_name: str):
+    """Connect to a saved SSH server"""
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     
-    sess = ssh_manager.get(chat_id)
-    if sess and sess.is_alive():
-        status = f"🟢 Connected to {sess.username}@{sess.host}:{sess.port}"
+    # Check if connection exists
+    connection = db.get_connection(user_id, connection_name)
+    if not connection:
+        await update.effective_message.reply_text(
+            f"Connection '{connection_name}' not found.\n"
+            "Use /connections to see available connections."
+        )
+        return
+    
+    # Try to connect
+    await update.effective_message.reply_text(
+        f"🔄 Connecting to {connection_name}..."
+    )
+    
+    try:
+        session = ssh_manager.connect_saved(user_id, chat_id, connection_name)
+        
+        if session.connected:
+            keyboard = keyboard_builder.session_actions()
+            await update.effective_message.reply_text(
+                f"✅ Connected to **{connection_name}**\n"
+                f"({connection.username}@{connection.host}:{connection.port})",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
+            )
+            
+            # Start output streaming task
+            session.task = asyncio.create_task(tail_output(chat_id, context))
+        else:
+            await update.effective_message.reply_text(
+                "⚠️ Connected but authentication may be required.\n"
+                "Send your password if prompted."
+            )
+    
+    except Exception as e:
+        logger.error(f"Connection failed: {e}")
+        await update.effective_message.reply_text(
+            f"❌ Connection failed: {str(e)}"
+        )
+
+async def quick_connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /quick command - Quick connect without saving"""
+    if not config.ALLOW_QUICK_CONNECT:
+        await update.message.reply_text("Quick connect is disabled.")
+        return
+    
+    if not await ensure_registered(update):
+        return
+    
+    args = update.message.text.split()
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /quick <host> [port] [username]\n"
+            "Example: /quick example.com 22 root"
+        )
+        return
+    
+    host = args[1]
+    port = int(args[2]) if len(args) > 2 and args[2].isdigit() else config.DEFAULT_SSH_PORT
+    username = args[3] if len(args) > 3 else config.DEFAULT_SSH_USER
+    chat_id = update.effective_chat.id
+    
+    await update.message.reply_text(f"🔄 Connecting to {username}@{host}:{port}...")
+    
+    try:
+        session = ssh_manager.connect_manual(chat_id, host, port, username)
+        
+        if not session.connected:
+            await update.message.reply_text(
+                "🔐 Authentication required. Please enter your password:"
+            )
+        else:
+            await update.message.reply_text(f"✅ Connected to {username}@{host}:{port}")
+        
+        # Start output streaming
+        session.task = asyncio.create_task(tail_output(chat_id, context))
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Connection failed: {str(e)}")
+
+async def disconnect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /disconnect command"""
+    if not await ensure_registered(update):
+        return
+    
+    chat_id = update.effective_chat.id
+    host = ssh_manager.disconnect(chat_id)
+    
+    if host:
+        await update.message.reply_text(f"✅ Disconnected from {host}")
+    else:
+        await update.message.reply_text("No active SSH connection.")
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status command"""
+    if not await ensure_registered(update):
+        return
+    
+    chat_id = update.effective_chat.id
+    session = ssh_manager.get(chat_id)
+    
+    if session and session.is_alive():
+        status = f"🟢 Connected to {session.username}@{session.host}:{session.port}"
+        if session.connection_id:
+            conn = db.get_connection_by_id(update.effective_user.id, session.connection_id)
+            if conn:
+                status += f"\nConnection: {conn.name}"
     else:
         status = "🔴 No active SSH connection"
     
-    await update.effective_message.reply_text(status)
+    await update.message.reply_text(status)
 
-
-async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_auth(update):
-        return await update.effective_message.reply_text("Unauthorized.")
-    chat_id = update.effective_chat.id
-    
-    # Check if TUI mode is active first
-    tui_sess = tui_sessions.get(chat_id)
-    if tui_sess and tui_sess.child.isalive():
-        raw = update.effective_message.text.partition(" ")[2]
-        if raw == "":
-            return await update.effective_message.reply_text("Usage: /send <text>")
-        tui_sess.child.send(raw)
-        # Recreate the TUI message to keep it at the bottom
-        await tui_sess.recreate_message()
+async def delete_connection_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /delete command"""
+    if not await ensure_registered(update):
         return
     
-    # Otherwise check SSH session
-    sess = ssh_manager.get(chat_id)
-    if not sess or not sess.is_alive():
-        return await update.effective_message.reply_text("No SSH connection active. Use /ssh to connect.")
-    # Raw send, no newline appended. Use with care for partial inputs.
-    raw = update.effective_message.text.partition(" ")[2]
-    if raw == "":
-        return await update.effective_message.reply_text("Usage: /send <text>")
-    sess.send(raw)
-
-
-async def line_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Default path: send the message with a trailing newline to SSH session
-    if not await ensure_auth(update):
-        return  # Ignore silently
-    chat_id = update.effective_chat.id
-    
-    # Check if TUI mode is active first
-    tui_sess = tui_sessions.get(chat_id)
-    if tui_sess and tui_sess.child.isalive():
-        # Send to TUI session
-        line = update.effective_message.text
-        tui_sess.child.send(line + "\n")
-        # Recreate the TUI message to keep it at the bottom
-        await tui_sess.recreate_message()
-        return
-    
-    # Otherwise check SSH session
-    sess = ssh_manager.get(chat_id)
-    if not sess or not sess.is_alive():
-        return  # Silently ignore if no connection
-    
-    line = update.effective_message.text
-    
-    # Special handling for password authentication
-    if not sess.connected:
-        # This might be a password response
-        sess.child.sendline(line)
-        try:
-            index = sess.child.expect([
-                r"\$",  # Shell prompt
-                r"#",   # Root shell prompt  
-                r">",   # Another prompt
-                "Permission denied",
-                "Authentication failed",
-                pexpect.TIMEOUT
-            ], timeout=5)
-            
-            if index in [0, 1, 2]:
-                sess.connected = True
-                await update.effective_message.reply_text(f"✅ Authentication successful! Connected to {sess.host}")
-            elif index in [3, 4]:
-                await update.effective_message.reply_text("❌ Authentication failed. Use /disconnect and try again.")
-                ssh_manager.disconnect(chat_id)
-                return
-        except Exception:
-            pass  # Let normal output handling show what happened
-        return
-    
-    # Normal command - append newline for typical CLI behavior
-    sess.send(line + "\n")
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        raise context.error
-    except Exception as e:
-        if isinstance(update, Update) and update.effective_chat:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Error: {escape_markdown_v2(str(e))}")
-        else:
-            print("Unhandled error:", e)
-
-
-# ------------------------- OPTIONAL: TUI SNAPSHOT MODE -------------------------
-# This mode keeps a fixed-size terminal grid (cols x rows) in memory using a VT100
-# emulator and periodically EDITS a single Telegram message to reflect the current
-# screen. This makes TUIs like `top` usable as a live "image" of text.
-#
-# Install extra dep:  pip install pyte
-
-import html
-import re
-try:
-    import pyte  # type: ignore
-    HAS_PYTE = True
-except Exception:
-    HAS_PYTE = False
-
-ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
-
-def _html_pre(s: str) -> str:
-    # Render inside <pre> to avoid Telegram MarkdownV2 escaping pain
-    return f"<pre>{html.escape(s)}</pre>"
-
-@dataclass
-class TuiSession:
-    child: pexpect.spawn
-    screen: "pyte.Screen"
-    stream: "pyte.Stream"
-    msg_id: Optional[int] = None
-    cols: int = 80
-    rows: int = 30
-    read_task: Optional[asyncio.Task] = None
-    render_task: Optional[asyncio.Task] = None
-    last_frame: str = ""
-    context: Optional[ContextTypes.DEFAULT_TYPE] = None
-    chat_id: Optional[int] = None
-    keyboard_msg_id: Optional[int] = None
-    recreating: bool = False
-    keyboard_mode: str = "navigation"
-
-    def stop(self):
-        if self.read_task and not self.read_task.done():
-            self.read_task.cancel()
-        if self.render_task and not self.render_task.done():
-            self.render_task.cancel()
-        if self.child.isalive():
-            try:
-                self.child.close(force=True)
-            except Exception:
-                pass
-    
-    async def recreate_message(self):
-        """Delete the old message and create a new one with current screen content"""
-        # Prevent concurrent recreations
-        if self.recreating:
-            return
-        
-        if self.msg_id and self.context and self.chat_id:
-            self.recreating = True
-            try:
-                # Delete old message
-                try:
-                    await self.context.bot.delete_message(chat_id=self.chat_id, message_id=self.msg_id)
-                except Exception:
-                    pass  # Message might already be deleted
-                
-                # Delete old keyboard if exists
-                if self.keyboard_msg_id:
-                    try:
-                        await self.context.bot.delete_message(chat_id=self.chat_id, message_id=self.keyboard_msg_id)
-                    except Exception:
-                        pass
-                
-                # Get current screen content
-                lines = list(self.screen.display)
-                padded = [(ln + " " * self.cols)[:self.cols] for ln in lines[:self.rows]]
-                while len(padded) < self.rows:
-                    padded.append(" " * self.cols)
-                frame = "\n".join(padded)
-                
-                # Create new terminal message
-                try:
-                    msg = await self.context.bot.send_message(
-                        chat_id=self.chat_id,
-                        text=_html_pre(frame),
-                        parse_mode=ParseMode.HTML
-                    )
-                    self.msg_id = msg.message_id
-                    self.last_frame = frame
-                    
-                    # Create new keyboard message with current mode
-                    keyboard_msg = await self.context.bot.send_message(
-                        chat_id=self.chat_id,
-                        text="📱 Terminal Controls:",
-                        reply_markup=get_terminal_keyboard(self.keyboard_mode)
-                    )
-                    self.keyboard_msg_id = keyboard_msg.message_id
-                except Exception:
-                    pass
-            finally:
-                self.recreating = False
-
-
-tui_sessions: Dict[int, TuiSession] = {}
-
-
-def _pick_safe_geometry(cols: int, rows: int) -> tuple[int, int]:
-    # Telegram displays messages best with ~60-70 chars width on most devices
-    # Mobile displays typically show ~50-60 chars comfortably
-    # Desktop can handle more but we optimize for mobile
-    
-    # First, cap width for better display on all devices
-    max_width_mobile = 60  # Optimal for mobile
-    max_width_desktop = 72  # Still readable on desktop
-    
-    # Use a reasonable default that works well on both
-    if cols > max_width_desktop:
-        cols = max_width_mobile  # Default to mobile-friendly width
-    
-    # Keep message under ~3900 chars (Telegram hard limit ~4096). Each row has a newline.
-    # Budget check: rows * (cols + 1) <= 3900
-    while rows * (cols + 1) > 3900:
-        if cols > 50:
-            cols -= 2
-        elif rows > 15:
-            rows -= 1
-        else:
-            break
-    
-    # Ensure minimum usable size
-    cols = max(40, cols)  # Minimum 40 chars wide
-    rows = max(10, rows)  # Minimum 10 rows
-    
-    return cols, rows
-
-
-async def tui_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_auth(update):
-        return await update.effective_message.reply_text("Unauthorized.")
-    if not HAS_PYTE:
-        return await update.effective_message.reply_text("Please install 'pyte' to use TUI snapshot mode: pip install pyte")
-
-    args = (update.effective_message.text or "").split()
-    sub = args[1] if len(args) > 1 else "help"
-
-    if sub in {"help", "?"}:
-        return await update.effective_message.reply_text(
-            "Usage: /tui start [COLSxROWS] | /tui size COLSxROWS | /tui stop\n"
-            "Examples: /tui start 80x40, /tui size 72x30\n"
-            "Tips: Use /send for raw text (no newline) and /key for arrows/esc.")
-
-    chat_id = update.effective_chat.id
-
-    if sub == "start":
-        # Check if SSH session exists
-        ssh_sess = ssh_manager.get(chat_id)
-        if not ssh_sess or not ssh_sess.is_alive():
-            return await update.effective_message.reply_text(
-                "No SSH connection active. Use /ssh to connect first."
-            )
-        
-        # Parse geometry - default to mobile-friendly size
-        cols, rows = 60, 24  # Good default for most devices
-        if len(args) >= 3 and "x" in args[2].lower():
-            try:
-                c, r = args[2].lower().split("x", 1)
-                cols, rows = int(c), int(r)
-            except Exception:
-                pass
-        cols, rows = _pick_safe_geometry(cols, rows)
-
-        # If already running, stop previous
-        if chat_id in tui_sessions:
-            tui_sessions[chat_id].stop()
-            tui_sessions.pop(chat_id, None)
-
-        # Use existing SSH session's child process
-        child = ssh_sess.child
-        # Set PTY size
-        try:
-            child.setwinsize(rows, cols)
-        except Exception:
-            pass
-
-        screen = pyte.Screen(cols, rows)
-        stream = pyte.Stream(screen)
-        sess = TuiSession(child=child, screen=screen, stream=stream, cols=cols, rows=rows, 
-                         context=context, chat_id=chat_id)
-        tui_sessions[chat_id] = sess
-
-        # Post placeholder message
-        msg = await update.effective_message.reply_html(_html_pre(f"TUI started {cols}x{rows}…"))
-        sess.msg_id = msg.message_id
-        
-        # Send keyboard controls
-        keyboard_msg = await update.effective_message.reply_text(
-            "📱 Terminal Controls:",
-            reply_markup=get_terminal_keyboard()
-        )
-        sess.keyboard_msg_id = keyboard_msg.message_id
-
-        async def reader():
-            # Continuously feed PTY output into the VT screen buffer
-            while True:
-                await asyncio.sleep(0.05)
-                if not child.isalive():
-                    break
-                try:
-                    data = child.read_nonblocking(65536, timeout=0)
-                except pexpect.exceptions.TIMEOUT:
-                    data = ""
-                except pexpect.exceptions.EOF:
-                    break
-                if data:
-                    try:
-                        stream.feed(data)
-                    except Exception:
-                        # As a fallback, strip ANSI and write raw
-                        stream.feed(ANSI.sub("", data))
-
-        async def renderer():
-            # Periodically render the screen buffer into one fixed-size frame
-            while True:
-                await asyncio.sleep(0.5)
-                if not child.isalive():
-                    break
-                
-                # Skip if currently recreating messages
-                if sess.recreating:
-                    continue
-                
-                # pyte.Screen.display already returns a list of visual lines
-                lines = list(screen.display)
-                # Ensure fixed geometry
-                padded = [ (ln + " " * sess.cols)[:sess.cols] for ln in lines[:sess.rows] ]
-                while len(padded) < sess.rows:
-                    padded.append(" " * sess.cols)
-                frame = "\n".join(padded)
-                
-                if frame != sess.last_frame and sess.msg_id is not None and not sess.recreating:
-                    sess.last_frame = frame
-                    try:
-                        # Try to edit existing message first
-                        await context.bot.edit_message_text(
-                            chat_id=chat_id, 
-                            message_id=sess.msg_id,
-                            text=_html_pre(frame), 
-                            parse_mode=ParseMode.HTML
-                        )
-                    except Exception as e:
-                        # Only create new if message was deleted, not for other errors
-                        if "message to edit not found" in str(e).lower() or "message identifier is not specified" in str(e).lower():
-                            if not sess.recreating:  # Double-check to prevent race condition
-                                try:
-                                    msg = await context.bot.send_message(
-                                        chat_id=chat_id,
-                                        text=_html_pre(frame),
-                                        parse_mode=ParseMode.HTML
-                                    )
-                                    sess.msg_id = msg.message_id
-                                except Exception:
-                                    pass
-
-        sess.read_task = asyncio.create_task(reader())
-        sess.render_task = asyncio.create_task(renderer())
-        return
-
-    if sub == "size":
-        geom = args[2] if len(args) >= 3 else ""
-        if chat_id not in tui_sessions:
-            return await update.effective_message.reply_text("No TUI running. Use /tui start first.")
-        try:
-            c, r = geom.lower().split("x", 1)
-            cols, rows = int(c), int(r)
-        except Exception:
-            return await update.effective_message.reply_text("Usage: /tui size COLSxROWS")
-        cols, rows = _pick_safe_geometry(cols, rows)
-        sess = tui_sessions[chat_id]
-        sess.cols, sess.rows = cols, rows
-        try:
-            sess.child.setwinsize(rows, cols)
-        except Exception:
-            pass
-        # Force re-render next tick
-        sess.last_frame = ""
-        return await update.effective_message.reply_text(f"Resized to {cols}x{rows}.")
-
-    if sub == "stop":
-        sess = tui_sessions.pop(chat_id, None)
-        if not sess:
-            return await update.effective_message.reply_text("No TUI running.")
-        sess.stop()
-        return await update.effective_message.reply_text("TUI stopped.")
-
-    return await update.effective_message.reply_text("Unknown subcommand. Use /tui help")
-
-
-# Virtual keys for TUIs - extended set for inline keyboard support
-KEYMAP = {
-    # Arrow keys
-    "up": "\x1b[A", "down": "\x1b[B", "left": "\x1b[D", "right": "\x1b[C",
-    # Special keys
-    "esc": "\x1b", "tab": "\t", "shift+tab": "\x1b[Z", "enter": "\r", "backspace": "\x7f", "delete": "\x1b[3~",
-    "space": " ",
-    # Function keys
-    "f1": "\x1bOP", "f2": "\x1bOQ", "f3": "\x1bOR", "f4": "\x1bOS",
-    "f5": "\x1b[15~", "f6": "\x1b[17~", "f7": "\x1b[18~", "f8": "\x1b[19~",
-    # Common ctrl combos
-    "ctrl+c": "\x03", "ctrl+z": "\x1a", "ctrl+d": "\x04", "ctrl+l": "\x0c",
-    "ctrl+a": "\x01", "ctrl+e": "\x05", "ctrl+w": "\x17", "ctrl+u": "\x15",
-    "ctrl+k": "\x0b", "ctrl+y": "\x19", "ctrl+r": "\x12", "ctrl+s": "\x13",
-    # Page navigation
-    "home": "\x1b[H", "end": "\x1b[F", "pgup": "\x1b[5~", "pgdn": "\x1b[6~",
-}
-
-def get_terminal_keyboard(mode="navigation"):
-    """Generate inline keyboard for terminal control"""
-    
-    if mode == "navigation":
-        keyboard = [
-            [
-                InlineKeyboardButton("⬆️", callback_data="key:up"),
-                InlineKeyboardButton("Home", callback_data="key:home"),
-                InlineKeyboardButton("PgUp", callback_data="key:pgup"),
-            ],
-            [
-                InlineKeyboardButton("⬅️", callback_data="key:left"),
-                InlineKeyboardButton("⬇️", callback_data="key:down"),
-                InlineKeyboardButton("➡️", callback_data="key:right"),
-            ],
-            [
-                InlineKeyboardButton("Tab →", callback_data="key:tab"),
-                InlineKeyboardButton("⇧Tab ←", callback_data="key:shift+tab"),
-                InlineKeyboardButton("Enter ⏎", callback_data="key:enter"),
-            ],
-            [
-                InlineKeyboardButton("End", callback_data="key:end"),
-                InlineKeyboardButton("PgDn", callback_data="key:pgdn"),
-                InlineKeyboardButton("Esc", callback_data="key:esc"),
-            ],
-            [
-                InlineKeyboardButton("🎛️ Ctrl", callback_data="kbd:ctrl"),
-                InlineKeyboardButton("⚡ Special", callback_data="kbd:special"),
-                InlineKeyboardButton("🔧 F-Keys", callback_data="kbd:function"),
-            ],
-            [
-                InlineKeyboardButton("🖥️ Open Web Terminal", callback_data="webapp:launch"),
-            ]
-        ]
-    
-    elif mode == "ctrl":
-        keyboard = [
-            [
-                InlineKeyboardButton("Ctrl+C (Cancel)", callback_data="key:ctrl+c"),
-                InlineKeyboardButton("Ctrl+D (EOF)", callback_data="key:ctrl+d"),
-            ],
-            [
-                InlineKeyboardButton("Ctrl+Z (Suspend)", callback_data="key:ctrl+z"),
-                InlineKeyboardButton("Ctrl+L (Clear)", callback_data="key:ctrl+l"),
-            ],
-            [
-                InlineKeyboardButton("Ctrl+A (Home)", callback_data="key:ctrl+a"),
-                InlineKeyboardButton("Ctrl+E (End)", callback_data="key:ctrl+e"),
-            ],
-            [
-                InlineKeyboardButton("Ctrl+W (Del Word)", callback_data="key:ctrl+w"),
-                InlineKeyboardButton("Ctrl+U (Del Line)", callback_data="key:ctrl+u"),
-            ],
-            [
-                InlineKeyboardButton("Ctrl+K (Kill Line)", callback_data="key:ctrl+k"),
-                InlineKeyboardButton("Ctrl+R (Search)", callback_data="key:ctrl+r"),
-            ],
-            [
-                InlineKeyboardButton("🔙 Back", callback_data="kbd:navigation"),
-            ],
-            [
-                InlineKeyboardButton("🖥️ Open Web Terminal", callback_data="webapp:launch"),
-            ]
-        ]
-    
-    elif mode == "special":
-        keyboard = [
-            [
-                InlineKeyboardButton("Enter ⏎", callback_data="key:enter"),
-                InlineKeyboardButton("Space", callback_data="key:space"),
-                InlineKeyboardButton("Esc", callback_data="key:esc"),
-            ],
-            [
-                InlineKeyboardButton("Backspace ⌫", callback_data="key:backspace"),
-                InlineKeyboardButton("Delete", callback_data="key:delete"),
-            ],
-            [
-                InlineKeyboardButton("🔙 Back", callback_data="kbd:navigation"),
-            ],
-            [
-                InlineKeyboardButton("🖥️ Open Web Terminal", callback_data="webapp:launch"),
-            ]
-        ]
-    
-    elif mode == "function":
-        keyboard = [
-            [
-                InlineKeyboardButton("F1", callback_data="key:f1"),
-                InlineKeyboardButton("F2", callback_data="key:f2"),
-                InlineKeyboardButton("F3", callback_data="key:f3"),
-                InlineKeyboardButton("F4", callback_data="key:f4"),
-            ],
-            [
-                InlineKeyboardButton("F5", callback_data="key:f5"),
-                InlineKeyboardButton("F6", callback_data="key:f6"),
-                InlineKeyboardButton("F7", callback_data="key:f7"),
-                InlineKeyboardButton("F8", callback_data="key:f8"),
-            ],
-            [
-                InlineKeyboardButton("🔙 Back", callback_data="kbd:navigation"),
-            ],
-            [
-                InlineKeyboardButton("🖥️ Open Web Terminal", callback_data="webapp:launch"),
-            ]
-        ]
-    
-    return InlineKeyboardMarkup(keyboard)
-
-async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_auth(update):
-        return
-    chat_id = update.effective_chat.id
-    
-    # Check TUI session first
-    tui_sess = tui_sessions.get(chat_id)
-    if tui_sess and tui_sess.child.isalive():
-        args = (update.effective_message.text or "").split()
-        if len(args) < 2:
-            return await update.effective_message.reply_text("Usage: /key <up|down|left|right|esc|tab|enter|ctrl+x>")
-        spec = args[1].lower()
-        if spec.startswith("ctrl+") and len(spec) == 6:
-            ch = spec[-1]
-            code = chr(ord(ch) & 0x1f)
-            tui_sess.child.send(code)
-            # Recreate the TUI message to keep it at the bottom
-            await tui_sess.recreate_message()
-            return
-        code = KEYMAP.get(spec)
-        if not code:
-            return await update.effective_message.reply_text("Unknown key.")
-        tui_sess.child.send(code)
-        # Recreate the TUI message to keep it at the bottom
-        await tui_sess.recreate_message()
-        return
-    
-    # Check regular SSH session
-    ssh_sess = ssh_manager.get(chat_id) 
-    if not ssh_sess or not ssh_sess.is_alive():
-        return await update.effective_message.reply_text("No active session.")
-    
-    args = (update.effective_message.text or "").split()
+    args = update.message.text.split(maxsplit=1)
     if len(args) < 2:
-        return await update.effective_message.reply_text("Usage: /key <up|down|left|right|esc|tab|enter|ctrl+x>")
-    spec = args[1].lower()
-    if spec.startswith("ctrl+") and len(spec) == 6:
-        ch = spec[-1]
-        code = chr(ord(ch) & 0x1f)
-        ssh_sess.child.send(code)
+        await update.message.reply_text(
+            "Usage: /delete <connection_name>"
+        )
         return
-    code = KEYMAP.get(spec)
-    if not code:
-        return await update.effective_message.reply_text("Unknown key.")
-    ssh_sess.child.send(code)
+    
+    connection_name = args[1]
+    user_id = update.effective_user.id
+    
+    keyboard = keyboard_builder.confirm_delete(connection_name)
+    await update.message.reply_text(
+        f"Are you sure you want to delete connection '{connection_name}'?",
+        reply_markup=keyboard
+    )
 
+async def setdefault_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /setdefault command"""
+    if not await ensure_registered(update):
+        return
+    
+    args = update.message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /setdefault <connection_name>"
+        )
+        return
+    
+    connection_name = args[1]
+    user_id = update.effective_user.id
+    
+    if db.set_default_connection(user_id, connection_name):
+        await update.message.reply_text(
+            f"⭐ Connection '{connection_name}' is now your default."
+        )
+    else:
+        await update.message.reply_text(
+            f"Connection '{connection_name}' not found."
+        )
 
-async def keyboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline keyboard button presses"""
+# ------------------------- MESSAGE HANDLERS -------------------------
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle regular text messages (send to SSH session)"""
+    if not await ensure_registered(update):
+        return
+    
+    chat_id = update.effective_chat.id
+    session = ssh_manager.get(chat_id)
+    
+    if not session or not session.is_alive():
+        # No active session - show menu
+        keyboard = keyboard_builder.main_menu()
+        await update.message.reply_text(
+            "No active SSH connection.\nChoose an action:",
+            reply_markup=keyboard
+        )
+        return
+    
+    # Send message to SSH session
+    text = update.message.text
+    
+    # Check if this is a password for authentication
+    if not session.connected:
+        session.child.sendline(text)
+        # Try to detect successful auth
+        try:
+            index = session.child.expect([r"\$", r"#", r">"], timeout=3)
+            session.connected = True
+            await update.message.reply_text("✅ Authentication successful!")
+        except:
+            await update.message.reply_text("🔐 Waiting for authentication...")
+    else:
+        # Normal command
+        session.send(text + "\n")
+
+# ------------------------- CALLBACK HANDLERS -------------------------
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard callbacks"""
     query = update.callback_query
     await query.answer()
     
-    chat_id = query.message.chat_id
-    data = query.data
-    
-    # Check TUI session exists
-    sess = tui_sessions.get(chat_id)
-    if not sess or not sess.child.isalive():
-        await query.edit_message_text("No TUI session active. Use /tui start")
+    if not await ensure_registered(update):
         return
     
-    if data.startswith("key:"):
-        # Send key to terminal
-        key_name = data[4:]
-        key_code = KEYMAP.get(key_name, "")
-        
-        if key_code:
-            sess.child.send(key_code)
-            # Don't recreate messages for keyboard input
-            # Let the renderer handle terminal updates naturally
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    data = query.data
+    
+    # Main menu callbacks
+    if data == "menu_main":
+        keyboard = keyboard_builder.main_menu()
+        await query.edit_message_text(
+            "Choose an action:",
+            reply_markup=keyboard
+        )
+    
+    elif data == "menu_add":
+        await query.edit_message_text(
+            "To add a new SSH connection, use the /add command.\n"
+            "I'll guide you through the setup process step by step.\n\n"
+            "Type /add to start."
+        )
+        return
+    
+    elif data == "menu_quick":
+        await query.edit_message_text(
+            "**Quick Connect** (without saving)\n\n"
+            "Use: `/quick <host> [port] [username]`\n\n"
+            "Examples:\n"
+            "• `/quick example.com`\n"
+            "• `/quick 192.168.1.100 22 root`\n"
+            "• `/quick server.local 2222 admin`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    elif data == "menu_settings":
+        user_id = update.effective_user.id
+        user = db.get_user(user_id)
+        settings_text = f"""
+**⚙️ Settings**
+
+**User ID:** `{user_id}`
+**Registered:** {user.registered_at.strftime('%Y-%m-%d')}
+**Connections:** {len(db.get_connections(user_id))}
+
+**Features:**
+• Quick Connect: {'✅' if config.ALLOW_QUICK_CONNECT else '❌'}
+• Key Upload: {'✅' if config.ALLOW_KEY_UPLOAD else '❌'}
+• Multi-Sessions: {'✅' if config.ALLOW_MULTIPLE_SESSIONS else '❌'}
+        """
+        await query.edit_message_text(
+            settings_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard_builder.main_menu()
+        )
+        return
+    
+    elif data == "menu_connect":
+        connections = connection_mgr.list_connections(user_id)
+        if not connections:
+            await query.edit_message_text(
+                "You don't have any saved connections yet.\n"
+                "Use /add to add your first connection!"
+            )
+        else:
+            keyboard = keyboard_builder.connections_list(connections, prefix="connect")
+            await query.edit_message_text(
+                "Select a connection:",
+                reply_markup=keyboard
+            )
+    
+    elif data.startswith("connect:"):
+        connection_id = int(data.split(":")[1])
+        connection = db.get_connection_by_id(user_id, connection_id)
+        if connection:
+            await query.edit_message_text(f"Connecting to {connection.name}...")
+            await connect_to_server(update, context, connection.name)
+    
+    elif data == "menu_list":
+        connections = connection_mgr.list_connections(user_id)
+        if not connections:
+            await query.edit_message_text(
+                "You don't have any saved connections yet."
+            )
+        else:
+            keyboard = keyboard_builder.connections_list(connections, prefix="manage")
+            await query.edit_message_text(
+                "Select a connection to manage:",
+                reply_markup=keyboard
+            )
+    
+    elif data.startswith("manage:"):
+        connection_id = int(data.split(":")[1])
+        connection = db.get_connection_by_id(user_id, connection_id)
+        if connection:
+            keyboard = keyboard_builder.connection_actions(connection.name)
+            info = format_connection_info(connection.to_dict())
+            await query.edit_message_text(
+                info,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
+            )
+    
+    elif data.startswith("confirm_delete:"):
+        connection_name = data.split(":")[1]
+        if db.delete_connection(user_id, connection_name):
+            await query.edit_message_text(
+                f"✅ Connection '{connection_name}' deleted."
+            )
+        else:
+            await query.edit_message_text(
+                f"Failed to delete connection."
+            )
+    
+    elif data == "session_disconnect":
+        host = ssh_manager.disconnect(chat_id)
+        if host:
+            await query.edit_message_text(f"✅ Disconnected from {host}")
+        else:
+            await query.edit_message_text("No active connection.")
+    
+    elif data == "session_tui":
+        # Switch to TUI mode with control buttons
+        session = ssh_manager.get(chat_id)
+        if session:
+            keyboard = keyboard_builder.tui_navigation()
+            await query.edit_message_text(
+                "🖥️ **TUI Mode Active**\n\n"
+                "Use the buttons below to navigate.\n"
+                "Send text messages to type commands.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
+            )
+        else:
+            await query.edit_message_text("No active SSH connection.")
+    
+    elif data == "session_webapp" or data == "webapp:launch":
+        # Launch web terminal
+        if not config.WEBAPP_URL:
+            await query.edit_message_text(
+                "Web terminal is not configured.\n"
+                "Please set WEBAPP_URL in your environment."
+            )
+        else:
+            from telegram import WebAppInfo
+            webapp_url = f"{config.WEBAPP_URL}?user_id={user_id}"
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🌐 Open Web Terminal",
+                    web_app=WebAppInfo(url=webapp_url)
+                )
+            ]])
+            await query.edit_message_text(
+                "Click below to open the web terminal:",
+                reply_markup=keyboard
+            )
+    
+    elif data.startswith("key:"):
+        # Handle key presses
+        key = data[4:]  # Remove "key:" prefix
+        session = ssh_manager.get(chat_id)
+        if session and session.is_alive():
+            # Map special keys to terminal sequences
+            key_map = {
+                'up': '\x1b[A', 'down': '\x1b[B', 
+                'right': '\x1b[C', 'left': '\x1b[D',
+                'home': '\x1b[H', 'end': '\x1b[F',
+                'pgup': '\x1b[5~', 'pgdn': '\x1b[6~',
+                'tab': '\t', 'shift+tab': '\x1b[Z',
+                'enter': '\n', 'esc': '\x1b',
+                'backspace': '\x7f', 'delete': '\x1b[3~',
+                'space': ' ',
+                'ctrl+a': '\x01', 'ctrl+b': '\x02', 'ctrl+c': '\x03',
+                'ctrl+d': '\x04', 'ctrl+e': '\x05', 'ctrl+f': '\x06',
+                'ctrl+k': '\x0b', 'ctrl+l': '\x0c', 'ctrl+r': '\x12',
+                'ctrl+u': '\x15', 'ctrl+w': '\x17', 'ctrl+z': '\x1a',
+                'f1': '\x1bOP', 'f2': '\x1bOQ', 'f3': '\x1bOR', 'f4': '\x1bOS',
+                'f5': '\x1b[15~', 'f6': '\x1b[17~', 'f7': '\x1b[18~', 'f8': '\x1b[19~',
+                'f9': '\x1b[20~', 'f10': '\x1b[21~', 'f11': '\x1b[23~', 'f12': '\x1b[24~',
+            }
+            
+            if key in key_map:
+                session.child.send(key_map[key])
+                await query.answer(f"Sent: {key}")
+            else:
+                await query.answer(f"Unknown key: {key}")
+        else:
+            await query.answer("No active SSH connection", show_alert=True)
     
     elif data.startswith("kbd:"):
-        # Switch keyboard layout
-        mode = data[4:]
-        sess.keyboard_mode = mode  # Save current mode
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=get_terminal_keyboard(mode)
+        # Switch keyboard layouts
+        kbd_type = data[4:]  # Remove "kbd:" prefix
+        session = ssh_manager.get(chat_id)
+        if session:
+            if kbd_type == "navigation":
+                keyboard = keyboard_builder.tui_navigation()
+                text = "🖥️ **TUI Navigation Mode**"
+            elif kbd_type == "ctrl":
+                keyboard = keyboard_builder.tui_ctrl()
+                text = "🎛️ **Ctrl Key Combinations**"
+            elif kbd_type == "special":
+                keyboard = keyboard_builder.tui_special()
+                text = "⚡ **Special Keys**"
+            elif kbd_type == "function":
+                keyboard = keyboard_builder.tui_function()
+                text = "🔧 **Function Keys**"
+            else:
+                keyboard = keyboard_builder.tui_navigation()
+                text = "🖥️ **TUI Mode**"
+            
+            await query.edit_message_text(
+                text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard
             )
-        except Exception:
-            # If message is too old to edit, send a new keyboard
-            try:
-                await query.message.delete()
-                keyboard_msg = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="📱 Terminal Controls:",
-                    reply_markup=get_terminal_keyboard(mode)
-                )
-                sess.keyboard_msg_id = keyboard_msg.message_id
-            except Exception:
-                pass
+        else:
+            await query.answer("No active SSH connection", show_alert=True)
     
-    elif data == "webapp:launch":
-        # Launch web app from inline button
-        webapp_url = os.environ.get("WEBAPP_URL", "https://your-domain.com/webapp")
-        
-        keyboard = [[
-            InlineKeyboardButton(
-                text="🖥️ Open Terminal Web App",
-                web_app=WebAppInfo(url=webapp_url)
-            )
-        ]]
-        
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Click the button below to open the terminal in a full-screen web app:\n\n"
-                 "This provides a better terminal experience with:\n"
-                 "• Full keyboard support\n"
-                 "• Better copy/paste\n"
-                 "• Proper terminal rendering\n"
-                 "• Touch-friendly controls",
-            reply_markup=reply_markup
+    elif data == "menu_help":
+        help_text = """
+**SSH Terminal Bot Commands**
+
+**Connection Management:**
+/add - Add new SSH connection
+/connections - List saved connections
+/connect <name> - Connect to saved server
+/delete <name> - Delete saved connection
+/setdefault <name> - Set default connection
+
+**Quick Actions:**
+/quick <host> [port] [user] - Quick connect (not saved)
+/disconnect - Close current SSH session
+/status - Show connection status
+
+**Other:**
+/help - Show this help
+/start - Show main menu
+        """
+        await query.edit_message_text(
+            help_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard_builder.main_menu()
         )
 
+# ------------------------- OUTPUT STREAMING -------------------------
+
+async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Stream SSH output to Telegram chat"""
+    session = ssh_manager.get(chat_id)
+    if not session:
+        return
+    
+    buffer = ""
+    last_send_time = asyncio.get_event_loop().time()
+    min_interval = 2.0  # Minimum seconds between messages to avoid rate limits
+    
+    while session and session.is_alive():
+        try:
+            # Check for output
+            output = session.child.read_nonblocking(size=4096, timeout=0)
+            if output:
+                buffer += output
+                
+                # Send if buffer is large enough or enough time has passed
+                current_time = asyncio.get_event_loop().time()
+                time_since_last = current_time - last_send_time
+                
+                # Only send if we have waited long enough and have content
+                if buffer and (len(buffer) > 3000 or time_since_last > min_interval):
+                    # If output is too long, send as file instead of multiple messages
+                    if len(buffer) > config.TG_MESSAGE_LIMIT:
+                        # Create a file-like object with the output
+                        output_file = io.BytesIO(buffer.encode('utf-8'))
+                        output_file.name = "terminal_output.txt"
+                        output_file.seek(0)
+                        
+                        try:
+                            # Send the file
+                            await context.bot.send_document(
+                                chat_id=chat_id,
+                                document=output_file,
+                                caption="📄 Terminal output (too long for messages)",
+                                filename=f"terminal_output_{datetime.now().strftime('%H%M%S')}.txt"
+                            )
+                        except Exception as e:
+                            # Fallback to sending first part as message if file fails
+                            chunk = buffer[:config.TG_MESSAGE_LIMIT]
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"```\n{chunk}\n```\n⚠️ Output truncated (too long)",
+                                    parse_mode=ParseMode.MARKDOWN
+                                )
+                            except:
+                                await context.bot.send_message(chat_id=chat_id, text=chunk)
+                    else:
+                        # Send as regular message if it fits
+                        try:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"```\n{buffer}\n```",
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                        except:
+                            # Try without markdown if it fails
+                            await context.bot.send_message(chat_id=chat_id, text=buffer)
+                    
+                    buffer = ""
+                    last_send_time = current_time
+        except:
+            pass
+        
+        await asyncio.sleep(config.POLL_INTERVAL)
+    
+    # Send any remaining buffer
+    if buffer:
+        if len(buffer) > config.TG_MESSAGE_LIMIT:
+            # Send as file
+            output_file = io.BytesIO(buffer.encode('utf-8'))
+            output_file.name = "terminal_output.txt"
+            output_file.seek(0)
+            
+            try:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=output_file,
+                    caption="📄 Final terminal output",
+                    filename=f"terminal_output_{datetime.now().strftime('%H%M%S')}.txt"
+                )
+            except:
+                pass
+        else:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"```\n{buffer}\n```",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except:
+                await context.bot.send_message(chat_id=chat_id, text=buffer)
+
+# ------------------------- WEBAPP COMMAND -------------------------
 
 async def webapp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Launch the terminal web app"""
-    if not await ensure_auth(update):
-        return await update.effective_message.reply_text("Unauthorized.")
+    if not await ensure_registered(update):
+        return
     
-    # Web app URL - you'll need to host this somewhere accessible
-    # For local testing, you can use ngrok or similar tunneling service
-    webapp_url = os.environ.get("WEBAPP_URL", "https://your-domain.com/webapp")
+    if not config.WEBAPP_URL:
+        await update.message.reply_text(
+            "Web terminal is not configured.\n"
+            "Please set WEBAPP_URL in your environment."
+        )
+        return
     
-    keyboard = [[
+    # Create webapp button
+    webapp_url = f"{config.WEBAPP_URL}?user_id={update.effective_user.id}"
+    keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
-            text="🖥️ Open Terminal Web App",
+            "🌐 Open Web Terminal",
             web_app=WebAppInfo(url=webapp_url)
         )
-    ]]
+    ]])
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.effective_message.reply_text(
-        "Click the button below to open the terminal in a full-screen web app:\n\n"
-        "This provides a better terminal experience with:\n"
-        "• Full keyboard support\n"
-        "• Better copy/paste\n"
-        "• Proper terminal rendering\n"
-        "• Touch-friendly controls",
-        reply_markup=reply_markup
+    await update.message.reply_text(
+        "Click below to open the full terminal interface:",
+        reply_markup=keyboard
     )
 
-
 # ------------------------- MAIN -------------------------
-async def main() -> None:
-    token = os.environ.get("TELEGRAM_TOKEN")
-    if not token:
-        raise SystemExit("Please set TELEGRAM_TOKEN environment variable.")
 
-    app = Application.builder().token(token).build()
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("ssh", ssh_cmd))
-    app.add_handler(CommandHandler("connect", ssh_cmd))  # Alias for ssh
-    app.add_handler(CommandHandler("disconnect", disconnect_cmd))
-    app.add_handler(CommandHandler("stop", disconnect_cmd))  # Alias for compatibility
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("send", send_cmd))
-
-    # Any non-command text goes to the shell as a line
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), line_handler))
-
-    # TUI snapshot mode handlers
-    app.add_handler(CommandHandler("tui", tui_cmd))
-    app.add_handler(CommandHandler("key", key_cmd))
+def main():
+    """Main function"""
+    # Create application
+    application = Application.builder().token(config.TELEGRAM_TOKEN).build()
     
-    # Web app handler
-    app.add_handler(CommandHandler("webapp", webapp_cmd))
+    # Add connection wizard FIRST (higher priority)
+    wizard = ConnectionWizard(db, encryption)
+    application.add_handler(wizard.get_handler())
     
-    # Inline keyboard handler
-    app.add_handler(CallbackQueryHandler(keyboard_callback))
-
-    app.add_error_handler(error_handler)
-
-    print("Bot up. Press Ctrl+C to stop.")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))
+    # Note: /add is handled by the ConversationHandler wizard above
+    application.add_handler(CommandHandler("connections", connections_cmd))
+    application.add_handler(CommandHandler("connect", connect_cmd))
+    application.add_handler(CommandHandler("quick", quick_connect_cmd))
+    application.add_handler(CommandHandler("disconnect", disconnect_cmd))
+    application.add_handler(CommandHandler("status", status_cmd))
+    application.add_handler(CommandHandler("delete", delete_connection_cmd))
+    application.add_handler(CommandHandler("setdefault", setdefault_cmd))
+    application.add_handler(CommandHandler("webapp", webapp_cmd))
     
-    # Keep the bot running
-    try:
-        await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-
+    # Add callback handler
+    application.add_handler(CallbackQueryHandler(callback_handler))
+    
+    # Add message handler LAST (lowest priority)
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        message_handler
+    ))
+    
+    # Start bot
+    logger.info("Starting SSH Terminal Bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    import nest_asyncio
-    nest_asyncio.apply()
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-
-# ------------------------- SECURITY (READ ME) -------------------------
-# 1) RESTRICT ACCESS: Populate AUTHORIZED_USER_IDS with your personal Telegram user ID(s).
-#    You can get your user ID via @userinfobot or similar. Never deploy without this.
-# 2) LEAST PRIVILEGE: Run the bot inside a Docker container or sandbox user with limited perms.
-#    Example (rootless):
-#      docker run --rm -it --name tgsh \
-#        -e TELEGRAM_TOKEN=... \
-#        --user 1000:1000 \
-#        -v /safe/workdir:/work -w /work \
-#        --pids-limit=200 --memory=512m --cpus=0.5 \
-#        ghcr.io/yourimage/python:3.11-slim python bot.py
-# 3) NETWORK & FS GUARDRAILS: Mount only what you need. Consider outbound firewall rules.
-# 4) AUDIT LOGS: Telegram stores history; avoid handling secrets here.
-# 5) FULL-SCREEN APPS: ncurses/TTY UIs spam updates; basic interaction works, but the UX is rough.
-# 6) MULTI-SESSION: This sample uses one PTY per chat. Extend ShellManager for per-user or multi-PTY.
-
+    main()
