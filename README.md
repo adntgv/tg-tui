@@ -1,15 +1,15 @@
-# Telegram Terminal Bot
+# SSH Telegram Terminal Bot
 
-A powerful Telegram bot that provides full terminal access through multiple interfaces - from simple shell commands to a complete web-based terminal emulator.
+A powerful Telegram bot that provides SSH terminal access to remote servers through multiple interfaces - connect to your servers securely via Telegram.
 
 ## Features
 
 ### 🤖 Bot Modes
 
-1. **Shell Mode** (`/startsh`) - Basic terminal in Telegram chat
-   - Direct command execution
-   - Interactive programs support (ssh, python REPL, etc.)
-   - PTY emulation for proper terminal behavior
+1. **SSH Mode** (`/ssh`) - SSH connection to remote servers
+   - Connect with `/ssh <host> [port] [username]`
+   - SSH key and password authentication support
+   - Full PTY emulation for interactive programs
 
 2. **TUI Mode** (`/tui start`) - Enhanced terminal with inline keyboard
    - Visual terminal display with ANSI color support
@@ -26,7 +26,9 @@ A powerful Telegram bot that provides full terminal access through multiple inte
 ### 🔒 Security
 
 - User authorization by Telegram ID whitelist
-- Secure PTY handling
+- SSH key-based authentication support
+- Uses existing SSH keys from `~/.ssh/`
+- Secure password handling
 - Session isolation per user
 
 ## Installation
@@ -99,23 +101,30 @@ ngrok http 8080
 
 ## Usage
 
-### Basic Shell Mode
+### SSH Connection Mode
 
-1. Start a shell session:
+1. Connect to a server:
 ```
-/startsh
+/ssh example.com
+/ssh server.local 2222 admin
+/ssh 192.168.1.100
 ```
 
-2. Run commands:
+2. Run commands on remote server:
 ```
 ls -la
 pwd
-echo "Hello, World!"
+echo "Hello from remote!"
 ```
 
-3. Stop the session:
+3. Disconnect from server:
 ```
-/stop
+/disconnect
+```
+
+4. Check connection status:
+```
+/status
 ```
 
 ### TUI Mode (Terminal UI)
@@ -172,8 +181,9 @@ tg-tui/
 ### How It Works
 
 1. **Bot Server** (`main.py`):
-   - Handles Telegram messages and commands
-   - Manages PTY sessions using `pexpect`
+   - Handles Telegram messages and SSH commands
+   - Manages SSH connections using `pexpect`
+   - Handles SSH authentication (key and password)
    - Renders terminal output using `pyte` for TUI mode
    - Provides inline keyboards for terminal control
 
@@ -191,13 +201,14 @@ tg-tui/
 
 ## Security Considerations
 
-⚠️ **IMPORTANT**: This bot provides full terminal access to your system!
+⚠️ **IMPORTANT**: This bot provides SSH access to remote servers!
 
 - **Always** restrict access using `AUTHORIZED_USER_IDS`
 - Never share your bot token publicly
-- Consider running in a container or restricted environment
-- Be cautious with commands that modify system files
+- Be cautious with SSH credentials
+- Use SSH keys when possible instead of passwords
 - Monitor bot usage through logs
+- Consider restricting SSH access to specific hosts
 
 ## Development
 

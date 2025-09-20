@@ -1,16 +1,17 @@
 """
-SSH Terminal Telegram Bot
+Interactive Shell Telegram Bot
 --------------------------------
-A Telegram bot that provides SSH terminal access to remote servers through multiple interfaces.
-Connect to your servers securely via Telegram with full PTY support.
+A Telegram bot that can start an interactive shell (PTY) per chat and relay stdin/stdout
+between Telegram and the shell. Supports true back-and-forth interaction with CLI tools.
 
-⚠️ SECURITY: This bot provides SSH access. Ensure proper access controls and use at your own risk.
+⚠️ SECURITY: Running a shell via a bot is dangerous. Read the SECURITY section below and
+restrict access before deploying.
 
 Requires: python-telegram-bot >= 21, pexpect
 
 pip install python-telegram-bot==21.6 pexpect
 
-Run with:  TELEGRAM_TOKEN=... python main.py
+Run with:  TELEGRAM_TOKEN=... python bot.py
 """
 
 import asyncio
@@ -31,9 +32,9 @@ AUTHORIZED_USER_IDS = {
     289310951
 }
 
-# SSH connection defaults
-DEFAULT_SSH_PORT = 22
-DEFAULT_SSH_USER = os.environ.get("USER", "root")
+# Optional: default shell and working directory
+DEFAULT_SHELL = os.environ.get("SHELL", "/bin/bash")
+DEFAULT_CWD = os.getcwd()
 
 # Telegram message size hard limit
 TG_LIMIT = 4096
@@ -43,74 +44,42 @@ POLL_INTERVAL = 0.2
 
 # ------------------------- STATE -------------------------
 @dataclass
-class SSHSession:
+class Session:
     child: pexpect.spawn
-    host: str
-    port: int
-    username: str
     buffer: str = ""
     task: Optional[asyncio.Task] = None
-    connected: bool = False
 
     def send(self, data: str):
+        # Ensure one newline per message unless user explicitly sends raw
         self.child.send(data)
 
     def is_alive(self) -> bool:
-        return self.child.isalive() and self.connected
+        return self.child.isalive()
 
 
-class SSHManager:
+class ShellManager:
     def __init__(self):
-        self.sessions: Dict[int, SSHSession] = {}
+        self.sessions: Dict[int, Session] = {}
 
-    def get(self, chat_id: int) -> Optional[SSHSession]:
+    def get(self, chat_id: int) -> Optional[Session]:
         return self.sessions.get(chat_id)
 
-    def connect(self, chat_id: int, host: str, port: int = DEFAULT_SSH_PORT, username: str = DEFAULT_SSH_USER) -> SSHSession:
+    def start(self, chat_id: int, shell: str = DEFAULT_SHELL, cwd: str = DEFAULT_CWD) -> Session:
         if chat_id in self.sessions and self.sessions[chat_id].is_alive():
-            raise RuntimeError("An SSH session is already active. Use /disconnect to close it.")
-        
-        # Build SSH command with options
-        ssh_cmd = f"ssh -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=60 -p {port} {username}@{host}"
-        
-        # Start SSH process via pexpect
-        child = pexpect.spawn(ssh_cmd, encoding="utf-8", timeout=30)
-        sess = SSHSession(child=child, host=host, port=port, username=username)
+            raise RuntimeError("A shell is already running in this chat. Use /stop to terminate.")
+        # Start an interactive PTY-managed process via pexpect
+        child = pexpect.spawn(shell, encoding="utf-8", timeout=None, cwd=cwd)
+        sess = Session(child=child)
         self.sessions[chat_id] = sess
-        
-        # Handle initial connection (password prompt or direct connection with key)
-        try:
-            index = child.expect([
-                "password:",  # Password prompt
-                "passphrase",  # SSH key passphrase
-                r"\$",  # Shell prompt (successful key auth)
-                r"#",   # Root shell prompt
-                r">",   # Another possible prompt
-                pexpect.EOF,
-                pexpect.TIMEOUT
-            ], timeout=10)
-            
-            if index in [0, 1]:  # Password or passphrase needed
-                sess.connected = False  # Will be set to True after auth
-            elif index in [2, 3, 4]:  # Connected successfully
-                sess.connected = True
-            else:
-                raise RuntimeError("SSH connection failed or timed out")
-                
-        except Exception as e:
-            child.close(force=True)
-            self.sessions.pop(chat_id, None)
-            raise RuntimeError(f"SSH connection failed: {str(e)}")
-        
         return sess
 
-    def disconnect(self, chat_id: int):
+    def stop(self, chat_id: int):
         sess = self.sessions.get(chat_id)
         if not sess:
             return
         try:
             if sess.child.isalive():
-                # Send exit command
+                # Send exit politely, then force-kill if needed
                 try:
                     sess.child.sendline("exit")
                     sess.child.expect(pexpect.EOF, timeout=1)
@@ -123,7 +92,7 @@ class SSHManager:
             self.sessions.pop(chat_id, None)
 
 
-ssh_manager = SSHManager()
+shells = ShellManager()
 
 # ------------------------- HELPERS -------------------------
 async def send_chunked(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE):
@@ -152,7 +121,7 @@ def escape_markdown_v2(s: str) -> str:
 
 
 async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    sess = ssh_manager.get(chat_id)
+    sess = shells.get(chat_id)
     if not sess:
         return
     child = sess.child
@@ -161,8 +130,8 @@ async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         try:
             await asyncio.sleep(POLL_INTERVAL)
             if not child.isalive():
-                await context.bot.send_message(chat_id=chat_id, text=f"SSH connection to {sess.host} closed.")
-                ssh_manager.disconnect(chat_id)
+                await context.bot.send_message(chat_id=chat_id, text="Shell exited.")
+                shells.stop(chat_id)
                 return
             # Use non-blocking read by checking child.before after expect with short timeout
             if child.exitstatus is None:
@@ -202,67 +171,37 @@ HELP_TEXT = textwrap.dedent(
     """
 
 Commands:
-  /ssh <host> [port] [user]  Connect to SSH server
-  /disconnect                Close current SSH connection
-  /status                    Show connection status
-  /tui start                 Start TUI mode with inline keyboard
-  /webapp                    Open full terminal web app
-  /send <text>               Send raw text (no newline) to SSH session
-  Type anything else         Sends the line to SSH session with newline
-
-Examples:
-  /ssh example.com
-  /ssh server.local 2222 admin
-  /ssh 192.168.1.100
+  /startsh            Start an interactive shell in this chat
+  /tui start          Start TUI mode with inline keyboard
+  /webapp             Open full terminal web app
+  /stop               Stop the running shell
+  /send <text>        Send raw text (no added newline) to the shell
+  Type anything else  Sends the line to the shell with a newline
 
 Notes:
-- Uses SSH keys from ~/.ssh/ for authentication
-- If no key is available, you'll be prompted for password
-- Full PTY support for interactive programs
+- This opens a PTY, so interactive programs (ssh, python REPL, top, etc.) work.
+- Full-screen TUIs (vim, top) may be hard to use over Telegram due to screen updates.
+- For passwords/prompts, just type the input as a message.
 - Web app provides the best terminal experience!
 """
 )
 
 
-async def ssh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def startsh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_auth(update):
         return await update.effective_message.reply_text("Unauthorized.")
-    
     chat_id = update.effective_chat.id
-    args = update.effective_message.text.split()
-    
-    if len(args) < 2:
-        return await update.effective_message.reply_text(
-            "Usage: /ssh <host> [port] [username]\n"
-            "Example: /ssh example.com 22 root"
-        )
-    
-    host = args[1]
-    port = int(args[2]) if len(args) > 2 and args[2].isdigit() else DEFAULT_SSH_PORT
-    username = args[3] if len(args) > 3 else DEFAULT_SSH_USER
-    
-    await update.effective_message.reply_text(f"Connecting to {username}@{host}:{port}...")
-    
     try:
-        sess = ssh_manager.connect(chat_id, host, port, username)
-        
-        # Check if password is needed
-        if not sess.connected:
-            await update.effective_message.reply_text(
-                "🔐 Authentication required. Please enter your password:\n"
-                "(Send it as a regular message)"
-            )
-        else:
-            await update.effective_message.reply_text(f"✅ Connected to {username}@{host}:{port}")
-        
-        # Start output streaming task
-        sess.task = asyncio.create_task(tail_output(chat_id, context))
-        
+        sess = shells.start(chat_id)
     except RuntimeError as e:
-        return await update.effective_message.reply_text(f"❌ Connection failed: {str(e)}")
+        return await update.effective_message.reply_text(str(e))
+
+    await update.effective_message.reply_text(f"Started shell: {DEFAULT_SHELL} in {DEFAULT_CWD}")
+    # Kick off a background task to stream output
+    sess.task = asyncio.create_task(tail_output(chat_id, context))
 
 
-async def disconnect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_auth(update):
         return await update.effective_message.reply_text("Unauthorized.")
     chat_id = update.effective_chat.id
@@ -272,30 +211,12 @@ async def disconnect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tui_sess:
         tui_sess.stop()
         tui_sessions.pop(chat_id, None)
-        await update.effective_message.reply_text("Disconnected from SSH (TUI mode).")
+        await update.effective_message.reply_text("Stopped TUI session.")
         return
     
-    # Disconnect SSH session
-    sess = ssh_manager.get(chat_id)
-    if sess:
-        host = sess.host
-        ssh_manager.disconnect(chat_id)
-        await update.effective_message.reply_text(f"✅ Disconnected from {host}")
-    else:
-        await update.effective_message.reply_text("No active SSH connection.")
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_auth(update):
-        return await update.effective_message.reply_text("Unauthorized.")
-    chat_id = update.effective_chat.id
-    
-    sess = ssh_manager.get(chat_id)
-    if sess and sess.is_alive():
-        status = f"🟢 Connected to {sess.username}@{sess.host}:{sess.port}"
-    else:
-        status = "🔴 No active SSH connection"
-    
-    await update.effective_message.reply_text(status)
+    # Stop regular shell
+    shells.stop(chat_id)
+    await update.effective_message.reply_text("Stopped shell.")
 
 
 async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,10 +235,10 @@ async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tui_sess.recreate_message()
         return
     
-    # Otherwise check SSH session
-    sess = ssh_manager.get(chat_id)
+    # Otherwise check regular shell
+    sess = shells.get(chat_id)
     if not sess or not sess.is_alive():
-        return await update.effective_message.reply_text("No SSH connection active. Use /ssh to connect.")
+        return await update.effective_message.reply_text("No shell is running. Use /startsh or /tui start.")
     # Raw send, no newline appended. Use with care for partial inputs.
     raw = update.effective_message.text.partition(" ")[2]
     if raw == "":
@@ -326,7 +247,7 @@ async def send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def line_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Default path: send the message with a trailing newline to SSH session
+    # Default path: send the message with a trailing newline to the shell
     if not await ensure_auth(update):
         return  # Ignore silently
     chat_id = update.effective_chat.id
@@ -341,39 +262,12 @@ async def line_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await tui_sess.recreate_message()
         return
     
-    # Otherwise check SSH session
-    sess = ssh_manager.get(chat_id)
+    # Otherwise check regular shell
+    sess = shells.get(chat_id)
     if not sess or not sess.is_alive():
-        return  # Silently ignore if no connection
-    
+        return await update.effective_message.reply_text("No shell is running. Use /startsh or /tui start.")
     line = update.effective_message.text
-    
-    # Special handling for password authentication
-    if not sess.connected:
-        # This might be a password response
-        sess.child.sendline(line)
-        try:
-            index = sess.child.expect([
-                r"\$",  # Shell prompt
-                r"#",   # Root shell prompt  
-                r">",   # Another prompt
-                "Permission denied",
-                "Authentication failed",
-                pexpect.TIMEOUT
-            ], timeout=5)
-            
-            if index in [0, 1, 2]:
-                sess.connected = True
-                await update.effective_message.reply_text(f"✅ Authentication successful! Connected to {sess.host}")
-            elif index in [3, 4]:
-                await update.effective_message.reply_text("❌ Authentication failed. Use /disconnect and try again.")
-                ssh_manager.disconnect(chat_id)
-                return
-        except Exception:
-            pass  # Let normal output handling show what happened
-        return
-    
-    # Normal command - append newline for typical CLI behavior
+    # Append newline for typical CLI behavior
     sess.send(line + "\n")
 
 
@@ -539,13 +433,6 @@ async def tui_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if sub == "start":
-        # Check if SSH session exists
-        ssh_sess = ssh_manager.get(chat_id)
-        if not ssh_sess or not ssh_sess.is_alive():
-            return await update.effective_message.reply_text(
-                "No SSH connection active. Use /ssh to connect first."
-            )
-        
         # Parse geometry - default to mobile-friendly size
         cols, rows = 60, 24  # Good default for most devices
         if len(args) >= 3 and "x" in args[2].lower():
@@ -561,8 +448,8 @@ async def tui_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tui_sessions[chat_id].stop()
             tui_sessions.pop(chat_id, None)
 
-        # Use existing SSH session's child process
-        child = ssh_sess.child
+        # Spawn shell and set winsize
+        child = pexpect.spawn(DEFAULT_SHELL, encoding="utf-8", timeout=None, cwd=DEFAULT_CWD)
         # Set PTY size
         try:
             child.setwinsize(rows, cols)
@@ -812,34 +699,9 @@ async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_auth(update):
         return
     chat_id = update.effective_chat.id
-    
-    # Check TUI session first
-    tui_sess = tui_sessions.get(chat_id)
-    if tui_sess and tui_sess.child.isalive():
-        args = (update.effective_message.text or "").split()
-        if len(args) < 2:
-            return await update.effective_message.reply_text("Usage: /key <up|down|left|right|esc|tab|enter|ctrl+x>")
-        spec = args[1].lower()
-        if spec.startswith("ctrl+") and len(spec) == 6:
-            ch = spec[-1]
-            code = chr(ord(ch) & 0x1f)
-            tui_sess.child.send(code)
-            # Recreate the TUI message to keep it at the bottom
-            await tui_sess.recreate_message()
-            return
-        code = KEYMAP.get(spec)
-        if not code:
-            return await update.effective_message.reply_text("Unknown key.")
-        tui_sess.child.send(code)
-        # Recreate the TUI message to keep it at the bottom
-        await tui_sess.recreate_message()
-        return
-    
-    # Check regular SSH session
-    ssh_sess = ssh_manager.get(chat_id) 
-    if not ssh_sess or not ssh_sess.is_alive():
-        return await update.effective_message.reply_text("No active session.")
-    
+    sess = tui_sessions.get(chat_id)
+    if not sess or not sess.child.isalive():
+        return await update.effective_message.reply_text("No TUI running.")
     args = (update.effective_message.text or "").split()
     if len(args) < 2:
         return await update.effective_message.reply_text("Usage: /key <up|down|left|right|esc|tab|enter|ctrl+x>")
@@ -847,12 +709,16 @@ async def key_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if spec.startswith("ctrl+") and len(spec) == 6:
         ch = spec[-1]
         code = chr(ord(ch) & 0x1f)
-        ssh_sess.child.send(code)
+        sess.child.send(code)
+        # Recreate the TUI message to keep it at the bottom
+        await sess.recreate_message()
         return
     code = KEYMAP.get(spec)
     if not code:
         return await update.effective_message.reply_text("Unknown key.")
-    ssh_sess.child.send(code)
+    sess.child.send(code)
+    # Recreate the TUI message to keep it at the bottom
+    await sess.recreate_message()
 
 
 async def keyboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -963,11 +829,8 @@ async def main() -> None:
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("ssh", ssh_cmd))
-    app.add_handler(CommandHandler("connect", ssh_cmd))  # Alias for ssh
-    app.add_handler(CommandHandler("disconnect", disconnect_cmd))
-    app.add_handler(CommandHandler("stop", disconnect_cmd))  # Alias for compatibility
-    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("startsh", startsh_cmd))
+    app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("send", send_cmd))
 
     # Any non-command text goes to the shell as a line
