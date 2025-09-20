@@ -171,9 +171,11 @@
         tg.ready();
         tg.expand();
         
-        // Get user info
+        // Get user info and session ID from URL
         const user = tg.initDataUnsafe?.user;
         const userId = user?.id || 'anonymous';
+        const urlParams = new URLSearchParams(window.location.search);
+        const sessionId = urlParams.get('session_id');
         
         // Initialize terminal
         const term = new Terminal({
@@ -212,9 +214,17 @@
             }
         });
         
-        // WebSocket connection
+        // WebSocket connection - use session endpoint if session_id is provided
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${protocol}//${window.location.host}/ws/${userId}`);
+        let wsUrl;
+        if (sessionId) {
+            wsUrl = `${protocol}//${window.location.host}/ws/session/${sessionId}`;
+            console.log('Connecting to SSH session:', sessionId);
+        } else {
+            wsUrl = `${protocol}//${window.location.host}/ws/${userId}`;
+            console.log('Connecting to local terminal for user:', userId);
+        }
+        const ws = new WebSocket(wsUrl);
         
         ws.onopen = () => {
             document.getElementById('status').className = 'connected';

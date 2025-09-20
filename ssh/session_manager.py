@@ -17,6 +17,7 @@ class SSHSession:
     port: int
     username: str
     connection_id: Optional[int] = None
+    session_id: Optional[str] = None  # Database session ID
     buffer: str = ""
     task: Optional[asyncio.Task] = None
     connected: bool = False
@@ -116,7 +117,8 @@ class EnhancedSSHManager:
                 
                 # Create active session in database
                 session_id = self.encryption.generate_session_id()
-                self.db.create_session(user_id, session_id, connection.id)
+                sess.session_id = session_id
+                self.db.create_session(user_id, session_id, connection.id, chat_id)
                 
         except Exception as e:
             sess.cleanup()

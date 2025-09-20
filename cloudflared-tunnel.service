@@ -1,0 +1,17 @@
+[Unit]
+Description=Cloudflare Tunnel for TG-TUI Webapp
+After=network.target
+
+[Service]
+Type=simple
+User=aid
+Group=aid
+WorkingDirectory=/home/aid/workspace/tg-tui
+ExecStart=/usr/local/bin/cloudflared tunnel --config /home/aid/workspace/tg-tui/cloudflared-config.yml run tg-tui-webapp
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

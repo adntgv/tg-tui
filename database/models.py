@@ -73,11 +73,31 @@ class ActiveSession(Base):
     started_at = Column(DateTime, default=datetime.utcnow)
     last_activity = Column(DateTime, default=datetime.utcnow)
     
+    # Terminal state fields
+    terminal_width = Column(Integer, default=80)
+    terminal_height = Column(Integer, default=24)
+    current_directory = Column(String(500), nullable=True)
+    is_webapp_connected = Column(Boolean, default=False)
+    chat_id = Column(Integer, nullable=True)  # Telegram chat ID for this session
+    
     # Relationships
     user = relationship("User", back_populates="sessions")
+    connection = relationship("SSHConnection", backref="active_sessions")
     
     def __repr__(self):
         return f"<ActiveSession(session_id={self.session_id}, user_id={self.user_id})>"
+    
+    def to_dict(self):
+        """Convert to dictionary for API responses"""
+        return {
+            'session_id': self.session_id,
+            'user_id': self.user_id,
+            'connection_id': self.connection_id,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'terminal_width': self.terminal_width,
+            'terminal_height': self.terminal_height,
+            'is_webapp_connected': self.is_webapp_connected
+        }
 
 
 class AuditLog(Base):

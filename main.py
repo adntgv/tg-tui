@@ -573,7 +573,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             from telegram import WebAppInfo
-            webapp_url = f"{config.WEBAPP_URL}?user_id={user_id}"
+            
+            # Check if there's an active SSH session to include session_id
+            session = ssh_manager.get(chat_id)
+            if session and session.is_alive() and session.session_id:
+                webapp_url = f"{config.WEBAPP_URL}?user_id={user_id}&session_id={session.session_id}"
+            else:
+                webapp_url = f"{config.WEBAPP_URL}?user_id={user_id}"
+            
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "🌐 Open Web Terminal",

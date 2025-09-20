@@ -120,13 +120,17 @@ class DatabaseManager:
         finally:
             session.close()
     
-    def get_connection_by_id(self, user_id: int, connection_id: int) -> Optional[SSHConnection]:
+    def get_connection_by_id(self, user_id: int = None, connection_id: int = None) -> Optional[SSHConnection]:
         """Get specific connection by ID"""
         session = self.get_session()
         try:
-            return session.query(SSHConnection).filter_by(
-                user_id=user_id, id=connection_id
-            ).first()
+            if user_id and connection_id:
+                return session.query(SSHConnection).filter_by(
+                    user_id=user_id, id=connection_id
+                ).first()
+            elif connection_id:
+                return session.query(SSHConnection).filter_by(id=connection_id).first()
+            return None
         finally:
             session.close()
     
@@ -181,7 +185,7 @@ class DatabaseManager:
             session.close()
     
     # Session Management
-    def create_session(self, user_id: int, session_id: str, connection_id: int = None) -> ActiveSession:
+    def create_session(self, user_id: int, session_id: str, connection_id: int = None, chat_id: int = None) -> ActiveSession:
         """Create new active session"""
         session = self.get_session()
         try:
@@ -191,7 +195,8 @@ class DatabaseManager:
             active_session = ActiveSession(
                 session_id=session_id,
                 user_id=user_id,
-                connection_id=connection_id
+                connection_id=connection_id,
+                chat_id=chat_id
             )
             session.add(active_session)
             session.commit()
@@ -204,6 +209,14 @@ class DatabaseManager:
         session = self.get_session()
         try:
             return session.query(ActiveSession).filter_by(user_id=user_id).first()
+        finally:
+            session.close()
+    
+    def get_session_by_id(self, session_id: str) -> Optional[ActiveSession]:
+        """Get session by session ID"""
+        session = self.get_session()
+        try:
+            return session.query(ActiveSession).filter_by(session_id=session_id).first()
         finally:
             session.close()
     
