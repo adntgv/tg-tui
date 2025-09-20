@@ -3,5 +3,5 @@ credentials-file: /home/aid/.cloudflared/tg-tui-webapp.json
 
 ingress:
   - hostname: tg-tui-webapp.adntgv.com
-    service: http://10.0.18.7:8000
+    service: http://localhost:8002
   - service: http_status:404
