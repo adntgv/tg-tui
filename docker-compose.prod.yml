@@ -27,6 +27,8 @@ services:
     build:
       context: ./webapp
       dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_TOKEN}
     restart: always
@@ -38,14 +40,16 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
-    restart: always
-    networks:
-      - tg-network
-    depends_on:
-      - webapp
+# Cloudflared is commented out - use Coolify's built-in reverse proxy
+  # Or configure Cloudflare tunnel separately pointing to your Coolify server
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+  #   restart: always
+  #   networks:
+  #     - tg-network
+  #   depends_on:
+  #     - webapp
 
 networks:
   tg-network:
