@@ -91,7 +91,8 @@ class ConnectionManager:
         if not credentials:
             return None, None
         
-        base_cmd = f"ssh -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=60"
+        # Force pseudo-terminal allocation and send TERM env for proper TUI support
+        base_cmd = f"ssh -tt -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=60 -o SendEnv=TERM"
         
         if credentials['auth_type'] == 'key':
             # Prepare key file

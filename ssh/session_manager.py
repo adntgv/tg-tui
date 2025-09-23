@@ -64,8 +64,16 @@ class EnhancedSSHManager:
         if not ssh_cmd:
             raise RuntimeError("Failed to prepare SSH command")
         
-        # Start SSH process
-        child = pexpect.spawn(ssh_cmd, encoding="utf-8", timeout=30)
+        # Start SSH process with proper terminal environment
+        env = os.environ.copy()
+        env['TERM'] = 'xterm-256color'
+        # Also set LINES and COLUMNS for better compatibility
+        env['LINES'] = '24'
+        env['COLUMNS'] = '80'
+
+        # Spawn with dimensions specified
+        child = pexpect.spawn(ssh_cmd, encoding="utf-8", timeout=30, env=env,
+                              dimensions=(24, 80))  # rows, columns
         sess = SSHSession(
             child=child,
             host=connection.host,
