@@ -1,14 +1,15 @@
-# Coolify Deployment Guide
+# Coolify Deployment Guide for TG-TUI
 
 ## Prerequisites
-- Coolify instance running (v4 recommended)
+- Coolify instance running with Traefik proxy active (port 80/443)
 - GitHub/GitLab repository with this code
 - Telegram Bot Token from @BotFather
+- Domain configured (e.g., tg-tui.adntgv.com)
 
 ## Deployment Steps
 
 ### 1. Create New Resource in Coolify
-1. Go to your Coolify dashboard
+1. Go to your Coolify dashboard (https://coolify.adntgv.com:8000)
 2. Click "New Resource" → "Docker Compose"
 3. Select your server
 
@@ -26,8 +27,15 @@ Add these in Coolify's environment variables section:
 
 ```bash
 TELEGRAM_TOKEN=your_bot_token_here
-WEBAPP_URL=https://your-app.coolify-domain.com
+WEBAPP_URL=https://tg-tui.adntgv.com
+ENCRYPTION_KEY=generate_strong_32_byte_hex_string
 WEBAPP_PORT=8000
+DATABASE_URL=sqlite:////app/data/ssh_connections.db
+```
+
+Generate encryption key with:
+```bash
+openssl rand -hex 32
 ```
 
 ### 5. Network Configuration

@@ -7,7 +7,11 @@ services:
       dockerfile: Dockerfile.bot
     environment:
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
-      - WEBAPP_URL=${WEBAPP_URL:-http://webapp:8000}
+      - WEBAPP_URL=http://webapp:8000  # Internal communication
+      - DATABASE_URL=sqlite:////app/data/ssh_connections.db
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-secure_key_change_in_production_Xk9mP2sL4nQ7rB6}
+    volumes:
+      - shared-data:/app/data
     restart: always
     depends_on:
       - webapp
@@ -21,22 +25,41 @@ services:
 
   webapp:
     build:
-      context: ./webapp
-      dockerfile: Dockerfile
+      context: .  # Changed from ./webapp to . (root)
+      dockerfile: webapp/Dockerfile  # Full path to webapp Dockerfile
     expose:
       - "8000"
     environment:
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_TOKEN}
+      - DATABASE_URL=sqlite:////app/data/ssh_connections.db
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-secure_key_change_in_production_Xk9mP2sL4nQ7rB6}
+      - WEBAPP_URL=${WEBAPP_URL:-https://tg-tui.adntgv.com}
       - PORT=8000
       - WEBAPP_PORT=8000
+    volumes:
+      - shared-data:/app/data
     restart: always
     networks:
       - internal
       - coolify
     labels:
+      # Coolify managed labels
       - "coolify.managed=true"
       - "coolify.type=application"
       - "coolify.port=8000"
+
+      # Traefik labels for routing (Coolify v4 uses Traefik)
+      - "traefik.enable=true"
+      - "traefik.http.routers.tgtui.rule=Host(`tg-tui.adntgv.com`)"
+      - "traefik.http.routers.tgtui.entrypoints=https"
+      - "traefik.http.routers.tgtui.tls=true"
+      - "traefik.http.routers.tgtui.tls.certresolver=letsencrypt"
+      - "traefik.http.services.tgtui.loadbalancer.server.port=8000"
+
+      # Caddy labels (in case Coolify uses Caddy)
+      - "caddy=tg-tui.adntgv.com"
+      - "caddy.reverse_proxy={{upstreams 8000}}"
     logging:
       driver: "json-file"
       options:
@@ -48,3 +71,7 @@ networks:
     driver: bridge
   coolify:
     external: true
+
+volumes:
+  shared-data:
+    driver: local
