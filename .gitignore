@@ -7,3 +7,5 @@ venv/
 .env
 *.db
 *.db-journal
+
+.env
