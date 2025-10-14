@@ -10,6 +10,14 @@ from database import DatabaseManager
 from security import EncryptionManager
 from .connections import ConnectionManager
 
+# Import VirtualTerminal - handle import error gracefully
+try:
+    from terminal_emulator import VirtualTerminal
+    HAS_VIRTUAL_TERMINAL = True
+except ImportError:
+    VirtualTerminal = None
+    HAS_VIRTUAL_TERMINAL = False
+
 @dataclass
 class SSHSession:
     child: pexpect.spawn
@@ -22,6 +30,13 @@ class SSHSession:
     task: Optional[asyncio.Task] = None
     connected: bool = False
     temp_key_file: Optional[str] = None  # For cleaning up temp SSH keys
+    virtual_terminal: Optional[VirtualTerminal] = None  # Virtual terminal for TUI apps
+    tui_mode: bool = False  # Track if user enabled TUI mode
+
+    def __post_init__(self):
+        """Initialize virtual terminal after object creation"""
+        if HAS_VIRTUAL_TERMINAL and VirtualTerminal:
+            self.virtual_terminal = VirtualTerminal(rows=24, cols=80)
     
     def send(self, data: str):
         self.child.send(data)
@@ -82,6 +97,8 @@ class EnhancedSSHManager:
             connection_id=connection.id,
             temp_key_file=temp_key_file
         )
+        # Enable TUI mode by default for better terminal experience
+        sess.tui_mode = True
         self.sessions[chat_id] = sess
         
         # Get credentials for authentication
@@ -103,8 +120,23 @@ class EnhancedSSHManager:
                 if credentials['auth_type'] == 'password' and credentials.get('password'):
                     child.sendline(credentials['password'])
                     # Wait for prompt after password
-                    child.expect([r"\$", r"#", r">"], timeout=10)
-                    sess.connected = True
+                    try:
+                        auth_result = child.expect([
+                            r"\$",  # Shell prompt - success
+                            r"#",   # Root prompt - success
+                            r">",   # Other prompt - success
+                            "Permission denied",  # Auth failed
+                            "password:",  # Wrong password, asking again
+                            pexpect.TIMEOUT
+                        ], timeout=10)
+
+                        if auth_result in [0, 1, 2]:
+                            sess.connected = True
+                        else:
+                            # Authentication failed
+                            raise RuntimeError("Authentication failed: incorrect password")
+                    except pexpect.TIMEOUT:
+                        raise RuntimeError("Authentication timeout after password")
                 else:
                     sess.connected = False
             elif index == 1:  # Key passphrase needed
@@ -129,9 +161,13 @@ class EnhancedSSHManager:
                 self.db.create_session(user_id, session_id, connection.id, chat_id)
                 
         except Exception as e:
+            # Add debug info for connection failures
+            error_msg = f"Connection failed: {str(e)}"
+            if hasattr(child, 'before'):
+                error_msg += f"\nSSH output: {child.before}"
             sess.cleanup()
             self.sessions.pop(chat_id, None)
-            raise RuntimeError(f"Connection failed: {str(e)}")
+            raise RuntimeError(error_msg)
         
         return sess
     
@@ -144,6 +180,8 @@ class EnhancedSSHManager:
         
         child = pexpect.spawn(ssh_cmd, encoding="utf-8", timeout=30)
         sess = SSHSession(child=child, host=host, port=port, username=username)
+        # Enable TUI mode by default for better terminal experience
+        sess.tui_mode = True
         self.sessions[chat_id] = sess
         
         # Handle initial connection
@@ -171,27 +209,34 @@ class EnhancedSSHManager:
         
         return sess
     
-    def disconnect(self, chat_id: int) -> Optional[str]:
+    def disconnect(self, chat_id: int, user_id: int = None) -> Optional[str]:
         """Disconnect SSH session"""
         sess = self.sessions.get(chat_id)
         if not sess:
             return None
-        
+
         host = sess.host
-        
+
         if sess.task:
             sess.task.cancel()
-        
+
         sess.child.terminate()
         sess.cleanup()  # Clean up temp files
-        
+
+        # Clean up database session if we have session_id
+        if sess.session_id:
+            # Try to find user_id from database if not provided
+            if not user_id:
+                db_session = self.db.get_session_by_id(sess.session_id)
+                if db_session:
+                    user_id = db_session.user_id
+
+            # Remove from active sessions in database
+            if user_id:
+                self.db.delete_session(user_id)
+
         self.sessions.pop(chat_id, None)
-        
-        # Remove from active sessions in database
-        # Note: We need user_id here, which should be passed or stored
-        # For now, we'll clean up based on connection_id
-        # This is a simplified version
-        
+
         return host
     
     def send_to_session(self, chat_id: int, data: str) -> bool:

@@ -211,6 +211,14 @@ class DatabaseManager:
             return session.query(ActiveSession).filter_by(user_id=user_id).first()
         finally:
             session.close()
+
+    def get_all_active_sessions(self) -> list[ActiveSession]:
+        """Get all active sessions for auto-reconnection"""
+        session = self.get_session()
+        try:
+            return session.query(ActiveSession).all()
+        finally:
+            session.close()
     
     def get_session_by_id(self, session_id: str) -> Optional[ActiveSession]:
         """Get session by session ID"""

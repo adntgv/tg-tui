@@ -97,18 +97,26 @@ class KeyboardBuilder:
     
     @staticmethod
     def session_actions() -> InlineKeyboardMarkup:
-        """Build session actions keyboard for active connection"""
+        """Build session actions keyboard for active connection - now with direct TUI controls"""
+        # TUI navigation controls are now top level, removed unnecessary buttons
         keyboard = [
             [
-                InlineKeyboardButton("📝 Send Command", callback_data="session_send"),
-                InlineKeyboardButton("🔄 Clear Screen", callback_data="session_clear"),
+                InlineKeyboardButton("↑", callback_data="key:up"),
+                InlineKeyboardButton("Tab →", callback_data="key:tab"),
+                InlineKeyboardButton("Enter ⏎", callback_data="key:enter"),
             ],
             [
-                InlineKeyboardButton("📊 Status", callback_data="session_status"),
+                InlineKeyboardButton("←", callback_data="key:left"),
+                InlineKeyboardButton("↓", callback_data="key:down"),
+                InlineKeyboardButton("→", callback_data="key:right"),
+            ],
+            [
+                InlineKeyboardButton("Esc", callback_data="key:esc"),
+                InlineKeyboardButton("Ctrl", callback_data="kbd:ctrl"),
+                InlineKeyboardButton("Space", callback_data="key:space"),
+            ],
+            [
                 InlineKeyboardButton("🔌 Disconnect", callback_data="session_disconnect"),
-            ],
-            [
-                InlineKeyboardButton("🖥️ TUI Mode", callback_data="session_tui"),
                 InlineKeyboardButton("🌐 Web Terminal", callback_data="session_webapp"),
             ]
         ]
@@ -121,13 +129,14 @@ class KeyboardBuilder:
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod
-    def tui_navigation() -> InlineKeyboardMarkup:
-        """Build TUI navigation keyboard"""
+    def tui_navigation(app_type: str = "general") -> InlineKeyboardMarkup:
+        """Build TUI navigation keyboard with app-specific shortcuts"""
+        # Simplified navigation keys - removed Home, End, PgUp, PgDn
         keyboard = [
             [
-                InlineKeyboardButton("Home", callback_data="key:home"),
                 InlineKeyboardButton("↑", callback_data="key:up"),
-                InlineKeyboardButton("PgUp", callback_data="key:pgup"),
+                InlineKeyboardButton("Tab →", callback_data="key:tab"),
+                InlineKeyboardButton("Enter ⏎", callback_data="key:enter"),
             ],
             [
                 InlineKeyboardButton("←", callback_data="key:left"),
@@ -135,25 +144,70 @@ class KeyboardBuilder:
                 InlineKeyboardButton("→", callback_data="key:right"),
             ],
             [
-                InlineKeyboardButton("Tab →", callback_data="key:tab"),
-                InlineKeyboardButton("⇧Tab ←", callback_data="key:shift+tab"),
-                InlineKeyboardButton("Enter ⏎", callback_data="key:enter"),
-            ],
-            [
-                InlineKeyboardButton("End", callback_data="key:end"),
-                InlineKeyboardButton("PgDn", callback_data="key:pgdn"),
                 InlineKeyboardButton("Esc", callback_data="key:esc"),
-            ],
-            [
-                InlineKeyboardButton("🎛️ Ctrl", callback_data="kbd:ctrl"),
-                InlineKeyboardButton("⚡ Special", callback_data="kbd:special"),
-                InlineKeyboardButton("🔧 F-Keys", callback_data="kbd:function"),
-            ],
+                InlineKeyboardButton("⇧Tab ←", callback_data="key:shift+tab"),
+                InlineKeyboardButton("Space", callback_data="key:space"),
+            ]
+        ]
+
+        # Add app-specific shortcuts
+        if app_type.lower() == "tmux":
+            keyboard.extend([
+                [
+                    InlineKeyboardButton("^B C", callback_data="key:ctrl+b,c"),  # New window
+                    InlineKeyboardButton("^B \"", callback_data="key:ctrl+b,\""),  # Split horizontal
+                    InlineKeyboardButton("^B %", callback_data="key:ctrl+b,%"),  # Split vertical
+                ],
+                [
+                    InlineKeyboardButton("^B D", callback_data="key:ctrl+b,d"),  # Detach
+                    InlineKeyboardButton("^B ?", callback_data="key:ctrl+b,?"),  # Help
+                ]
+            ])
+        elif app_type.lower() == "vim":
+            keyboard.extend([
+                [
+                    InlineKeyboardButton("i", callback_data="key:i"),  # Insert mode
+                    InlineKeyboardButton(":w", callback_data="key::w"),  # Save
+                    InlineKeyboardButton(":q", callback_data="key::q"),  # Quit
+                ],
+                [
+                    InlineKeyboardButton(":wq", callback_data="key::wq"),  # Save & quit
+                    InlineKeyboardButton("/", callback_data="key:/"),  # Search
+                ]
+            ])
+        elif app_type.lower() == "nano":
+            keyboard.extend([
+                [
+                    InlineKeyboardButton("^O", callback_data="key:ctrl+o"),  # Save
+                    InlineKeyboardButton("^X", callback_data="key:ctrl+x"),  # Exit
+                    InlineKeyboardButton("^W", callback_data="key:ctrl+w"),  # Search
+                ]
+            ])
+        elif app_type.lower() == "htop":
+            keyboard.extend([
+                [
+                    InlineKeyboardButton("F9", callback_data="key:f9"),  # Kill
+                    InlineKeyboardButton("F5", callback_data="key:f5"),  # Tree
+                    InlineKeyboardButton("q", callback_data="key:q"),  # Quit
+                ]
+            ])
+        else:
+            # General TUI shortcuts - simplified
+            keyboard.extend([
+                [
+                    InlineKeyboardButton("🎛️ Ctrl", callback_data="kbd:ctrl"),
+                    InlineKeyboardButton("🔧 F-Keys", callback_data="kbd:function"),
+                ]
+            ])
+
+        # Always add disconnect and webapp options
+        keyboard.extend([
             [
                 InlineKeyboardButton("🔌 Disconnect", callback_data="session_disconnect"),
                 InlineKeyboardButton("🌐 Web Terminal", callback_data="webapp:launch"),
             ]
-        ]
+        ])
+
         return InlineKeyboardMarkup(keyboard)
     
     @staticmethod

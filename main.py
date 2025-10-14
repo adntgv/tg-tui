@@ -51,6 +51,9 @@ except ImportError:
     HAS_PYTE = False
     print("pyte not installed - TUI mode disabled")
 
+# Import our virtual terminal emulator
+from terminal_emulator import VirtualTerminal, TUIAppType, ScreenDiff
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO if not config.DEBUG else logging.DEBUG,
@@ -246,15 +249,13 @@ async def connect_to_server(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         session = ssh_manager.connect_saved(user_id, chat_id, connection_name)
         
         if session.connected:
-            keyboard = keyboard_builder.session_actions()
             await update.effective_message.reply_text(
                 f"✅ Connected to **{connection_name}**\n"
                 f"({connection.username}@{connection.host}:{connection.port})",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard
+                parse_mode=ParseMode.MARKDOWN
             )
-            
-            # Start output streaming task
+
+            # Start output streaming task - this will send the keyboard
             session.task = asyncio.create_task(tail_output(chat_id, context))
         else:
             await update.effective_message.reply_text(
@@ -314,7 +315,8 @@ async def disconnect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     chat_id = update.effective_chat.id
-    host = ssh_manager.disconnect(chat_id)
+    user_id = update.effective_user.id
+    host = ssh_manager.disconnect(chat_id, user_id)
     
     if host:
         await update.message.reply_text(f"✅ Disconnected from {host}")
@@ -542,20 +544,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Failed to delete connection."
             )
     
+    elif data == "session_controls":
+        # Show session control options
+        session = ssh_manager.get(chat_id)
+        if session:
+            await query.edit_message_text(
+                "📋 **Session Controls**\n\n"
+                "Choose an action:",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard_builder.session_actions()
+            )
+        else:
+            await query.edit_message_text("No active SSH connection.")
+
     elif data == "session_disconnect":
-        host = ssh_manager.disconnect(chat_id)
+        host = ssh_manager.disconnect(chat_id, user_id)
         if host:
             await query.edit_message_text(f"✅ Disconnected from {host}")
         else:
             await query.edit_message_text("No active connection.")
-    
+
     elif data == "session_tui":
         # Switch to TUI mode with control buttons
         session = ssh_manager.get(chat_id)
         if session:
-            keyboard = keyboard_builder.tui_navigation()
+            # TUI mode is already enabled by default
+            # Just show a message that they're in TUI mode
+            keyboard = keyboard_builder.session_actions()
             await query.edit_message_text(
-                "🖥️ **TUI Mode Active**\n\n"
+                "🖥️ **Terminal Controls**\n\n"
                 "Use the buttons below to navigate.\n"
                 "Send text messages to type commands.",
                 parse_mode=ParseMode.MARKDOWN,
@@ -619,6 +636,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if key in key_map:
                 session.child.send(key_map[key])
                 await query.answer(f"Sent: {key}")
+            elif key.startswith("ctrl+b,"):
+                # Handle tmux command sequences (Ctrl+B followed by another key)
+                tmux_key = key[7:]  # Remove "ctrl+b," prefix
+                session.child.send('\x02')  # Send Ctrl+B first
+                session.child.send(tmux_key)  # Then send the tmux command key
+                await query.answer(f"Sent: Ctrl+B {tmux_key}")
+            elif key.startswith(":"):
+                # Handle vim command sequences
+                vim_command = key + '\r'  # Add enter to execute command
+                session.child.send(vim_command)
+                await query.answer(f"Sent vim command: {key}")
+            elif len(key) == 1:
+                # Handle single character keys (letters, numbers, symbols)
+                session.child.send(key)
+                await query.answer(f"Sent: {key}")
             else:
                 await query.answer(f"Unknown key: {key}")
         else:
@@ -630,8 +662,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = ssh_manager.get(chat_id)
         if session:
             if kbd_type == "navigation":
-                keyboard = keyboard_builder.tui_navigation()
-                text = "🖥️ **TUI Navigation Mode**"
+                keyboard = keyboard_builder.session_actions()
+                text = "🖥️ **Terminal Controls**"
             elif kbd_type == "ctrl":
                 keyboard = keyboard_builder.tui_ctrl()
                 text = "🎛️ **Ctrl Key Combinations**"
@@ -642,8 +674,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 keyboard = keyboard_builder.tui_function()
                 text = "🔧 **Function Keys**"
             else:
-                keyboard = keyboard_builder.tui_navigation()
-                text = "🖥️ **TUI Mode**"
+                keyboard = keyboard_builder.session_actions()
+                text = "🖥️ **Terminal Controls**"
             
             await query.edit_message_text(
                 text,
@@ -681,58 +713,215 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------- OUTPUT STREAMING -------------------------
 
+def _clean_ansi_sequences(text: str) -> str:
+    """Aggressively clean all ANSI escape sequences from text"""
+    # Remove ALL ANSI escape sequences
+    text = re.sub(r'\x1b\[[0-9;]*m', '', text)  # SGR sequences (colors/styles)
+    text = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', text)  # CSI sequences
+    text = re.sub(r'\x1b\].*?[\x07\x1b\\]', '', text)  # OSC sequences
+    text = re.sub(r'\x1b[PX^_].*?\x1b\\', '', text)  # DCS/SOS/PM/APC
+    text = re.sub(r'\x1b[()][AB012]', '', text)  # Character set selection
+    text = re.sub(r'\x1b[NO]', '', text)  # SS2/SS3
+
+    # Remove character set selection sequences that create (B
+    text = re.sub(r'\x1b\([0-9A-Z]', '', text)  # ESC ( X patterns
+    text = re.sub(r'\x1b\)[0-9A-Z]', '', text)  # ESC ) X patterns
+
+    # Multiple passes to catch nested sequences
+    text = re.sub(r'\(B', '', text)  # Specifically remove (B
+    text = re.sub(r'\(0', '', text)  # Specifically remove (0
+    text = re.sub(r'\(A', '', text)  # Specifically remove (A
+    text = re.sub(r'\([B0AB]', '', text)  # Character set designators
+    text = re.sub(r'\)[B0AB]', '', text)  # Alternative form
+
+    # Remove control characters
+    text = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', text)
+
+    # Final multiple passes to ensure no (B remains
+    for _ in range(3):
+        text = text.replace('(B', '')
+
+    # Debug logging and last resort fix
+    if '(B' in text:
+        print(f"WARNING: (B still present after cleaning, applying character-level fix")
+        # Character-level removal as absolute last resort
+        result = []
+        i = 0
+        while i < len(text):
+            if i < len(text) - 1 and text[i] == '(' and text[i+1] == 'B':
+                i += 2  # Skip both characters
+            else:
+                result.append(text[i])
+                i += 1
+        text = ''.join(result)
+
+    return text
+
 async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Stream SSH output to Telegram chat"""
     session = ssh_manager.get(chat_id)
     if not session:
         return
-    
+
     buffer = ""
     last_send_time = asyncio.get_event_loop().time()
-    min_interval = 1.0  # Reduced interval for more responsive output
+    min_interval = 2.0  # Increased to avoid rate limits
     last_message_id = None  # Track the last output message
     keyboard_message_id = None  # Track the keyboard message
     accumulated_output = ""  # Keep all output for editing
-    
-    # Send initial keyboard
-    try:
-        keyboard_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="🖥️ **Terminal Controls**",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=keyboard_builder.session_actions()
-        )
-        keyboard_message_id = keyboard_msg.message_id
-    except:
-        pass
-    
+    tui_mode = False  # Track if we're in TUI mode
+    last_was_clear = False  # Track screen clear commands
+    last_content_hash = ""  # Track content to avoid unnecessary updates
+
+    # Don't send keyboard immediately - wait for first output to establish proper order
+
     while session and session.is_alive():
         try:
             # Check for output
             output = session.child.read_nonblocking(size=4096, timeout=0)
             if output:
-                # Filter out common ANSI escape sequences and control codes
-                # Note: Complex TUI apps like tmux/vim work better in web terminal
-                original_output = output
-                
-                # Comprehensive ANSI filtering
-                # Remove all CSI sequences (the most common ANSI escape sequences)
-                output = re.sub(r'\x1b\[[^m]*m', '', output)  # Remove all SGR sequences
-                output = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', output)  # Remove all CSI sequences
-                output = re.sub(r'\x1b\].*?\x07', '', output)  # OSC sequences (window title, etc)
-                output = re.sub(r'\x1b[PX^_].*?\x1b\\', '', output)  # DCS/SOS/PM/APC sequences
-                output = re.sub(r'\x1b\[[\?!][0-9;]*[a-zA-Z]', '', output)  # Private sequences
-                output = re.sub(r'\x1b[NO]', '', output)  # SS2/SS3
-                output = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]', '', output)  # Control chars except \t, \n, \r
-                
-                # Detect if this looks like a TUI app (lots of escape codes)
-                escape_ratio = len(original_output) - len(output)
-                if escape_ratio > len(output) * 0.5 and not hasattr(session, 'tui_warning_shown'):
-                    # Suggest web terminal for better experience (only once per session)
-                    buffer += "\n💡 Tip: Complex TUI apps work better in the web terminal. Use /webapp command.\n"
-                    session.tui_warning_shown = True
-                
-                buffer += output
+                # Debug logging to track (B sequences
+                if '(B' in output:
+                    print(f"DEBUG: Raw output contains (B: {output[:100]}", flush=True)
+
+                # Auto-detect TUI apps and enable virtual terminal
+                if not session.tui_mode and any(pattern in output for pattern in [
+                    '\x1b[?1049h', '\x1b[?47h', 'tmux', '\x1b[2J'
+                ]):
+                    session.tui_mode = True
+                    print(f"DEBUG: Auto-enabled TUI mode", flush=True)
+
+                # Always use virtual terminal since TUI mode is default
+                if session.virtual_terminal:
+                    try:
+                        print(f"DEBUG: Using virtual terminal for TUI mode", flush=True)
+                        # Feed data to virtual terminal
+                        screen_diff = session.virtual_terminal.feed_data(output)
+
+                        # Render for Telegram - reduced height as requested
+                        rendered_output = session.virtual_terminal.render_for_telegram(
+                            screen_diff, max_lines=12  # Reduced from 20 to 12
+                        )
+
+                        if rendered_output:
+                            # ULTRA-AGGRESSIVE (B cleaning - multiple passes
+                            cleaned_rendered = rendered_output
+
+                            # Pass 1: Standard ANSI cleaning
+                            cleaned_rendered = _clean_ansi_sequences(cleaned_rendered)
+
+                            # Pass 2-6: Multiple (B removal passes
+                            for i in range(5):
+                                cleaned_rendered = cleaned_rendered.replace('(B', '')
+                                cleaned_rendered = cleaned_rendered.replace('( B', '')
+                                cleaned_rendered = cleaned_rendered.replace('(B)', '')
+                                cleaned_rendered = re.sub(r'\([B0AB]', '', cleaned_rendered)
+
+                            # Pass 7: Manual character-by-character (B removal
+                            result = []
+                            i = 0
+                            while i < len(cleaned_rendered):
+                                if i < len(cleaned_rendered) - 1 and cleaned_rendered[i] == '(' and cleaned_rendered[i+1] == 'B':
+                                    i += 2  # Skip (B
+                                else:
+                                    result.append(cleaned_rendered[i])
+                                    i += 1
+                            cleaned_rendered = ''.join(result)
+
+                            # Debug check
+                            if '(B' in cleaned_rendered:
+                                print(f"ERROR: (B STILL SURVIVED ALL CLEANING: {cleaned_rendered[:100]}", flush=True)
+
+                            buffer += cleaned_rendered
+
+                            # Show app-specific help and update keyboard on first detection
+                            if (screen_diff.is_major_change and
+                                session.virtual_terminal.current_app != TUIAppType.UNKNOWN and
+                                not hasattr(session, 'app_help_shown')):
+
+                                help_text = session.virtual_terminal.get_app_specific_help()
+                                if help_text:
+                                    buffer = f"{help_text}\n\n{buffer}"
+                                    session.app_help_shown = True
+
+                                # Update keyboard to app-specific layout
+                                try:
+                                    app_name = session.virtual_terminal.current_app.value
+                                    new_keyboard = keyboard_builder.tui_navigation(app_name)
+
+                                    if keyboard_message_id:
+                                        await context.bot.edit_message_text(
+                                            chat_id=chat_id,
+                                            message_id=keyboard_message_id,
+                                            text=f"🖥️ **{app_name.upper()} Controls**",
+                                            parse_mode=ParseMode.MARKDOWN,
+                                            reply_markup=new_keyboard
+                                        )
+                                except Exception as keyboard_error:
+                                    print(f"Keyboard update error: {keyboard_error}")
+
+                        # Update TUI mode flag
+                        tui_mode = session.virtual_terminal.in_alt_screen
+                        session.tui_mode = tui_mode
+
+                    except Exception as e:
+                        print(f"Virtual terminal error: {e}")
+                        # Fall back to old processing with cleaning
+                        cleaned_output = _clean_ansi_sequences(output)
+                        buffer += cleaned_output
+                else:
+                    # Legacy processing for non-TUI mode
+                    original_output = output
+
+                    # Detect TUI mode by looking for specific patterns
+                    if any(pattern in original_output for pattern in [
+                        '\x1b[?1049h',  # Enter alternate screen (tmux, vim, etc)
+                        '\x1b[?47h',     # Alternative screen buffer
+                        '\x1b[2J',       # Clear entire screen
+                        '\x1b[H',        # Cursor home
+                        'tmux',          # Tmux signature
+                        'GNU nano',      # Nano signature
+                        'VIM - Vi',      # Vim signature
+                    ]):
+                        tui_mode = True
+                        session.tui_mode = True
+
+                    # Check for exit from TUI mode
+                    if '\x1b[?1049l' in original_output or '\x1b[?47l' in original_output:
+                        tui_mode = False
+                        session.tui_mode = False
+                        accumulated_output = ""
+
+                    # Check for screen clear command
+                    if '\x1b[2J' in original_output or '\x1b[H\x1b[2J' in original_output:
+                        last_was_clear = True
+                        accumulated_output = ""
+                        buffer = ""
+
+                    # Apply comprehensive ANSI filtering for all modes
+                    # Remove ALL ANSI escape sequences for clean Telegram display
+                    output = re.sub(r'\x1b\[[0-9;]*m', '', output)  # SGR sequences (colors/styles)
+                    output = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', output)  # CSI sequences
+                    output = re.sub(r'\x1b\].*?[\x07\x1b\\]', '', output)  # OSC sequences
+                    output = re.sub(r'\x1b[PX^_].*?\x1b\\', '', output)  # DCS/SOS/PM/APC
+                    output = re.sub(r'\x1b[()][AB012]', '', output)  # Character set selection
+                    output = re.sub(r'\x1b[NO]', '', output)  # SS2/SS3
+                    output = re.sub(r'\([B0AB]', '', output)  # Character set designators like (B
+                    output = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', output)  # Control chars
+
+                    if tui_mode:
+                        # For TUI mode, convert some positioning to structure
+                        output = re.sub(r'\x1b\[[0-9;]*H', '\n', output)  # Cursor positioning to newline
+                        output = re.sub(r'\x1b\[[0-9]*J', '\n', output)  # Screen clear to newline
+
+                        # Show TUI warning once
+                        if not hasattr(session, 'tui_warning_shown'):
+                            buffer = "📺 TUI Mode Detected (Fallback)\n💡 For better experience use /webapp\n\n"
+                            session.tui_warning_shown = True
+
+                    # Apply final cleaning to all output
+                    cleaned_output = _clean_ansi_sequences(output)
+                    buffer += cleaned_output
                 
                 # Send if buffer is large enough or enough time has passed
                 current_time = asyncio.get_event_loop().time()
@@ -743,19 +932,74 @@ async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 prompt_patterns = ['\n$ ', '\n# ', '\n> ', '$ ', '# ', '> ']
                 has_prompt = any(buffer.endswith(p) for p in prompt_patterns)
                 
-                if buffer and (len(buffer) > 3000 or time_since_last > min_interval or has_prompt):
-                    # Add to accumulated output
-                    accumulated_output += buffer
-                    
+                # Different send conditions for TUI vs normal mode
+                should_send = False
+                if tui_mode:
+                    # In TUI mode, send less frequently but when we have a complete screen update
+                    should_send = (len(buffer) > 2000 or time_since_last > 3.0 or last_was_clear)
+                else:
+                    # Normal mode - existing logic
+                    should_send = (len(buffer) > 3000 or time_since_last > min_interval or has_prompt)
+
+                if buffer and should_send:
+                    # Handle output accumulation differently for TUI mode
+                    if tui_mode and last_was_clear:
+                        # For TUI apps after screen clear, replace accumulated output entirely
+                        # Clean buffer before accumulating
+                        clean_buffer = _clean_ansi_sequences(buffer)
+                        clean_buffer = clean_buffer.replace('(B', '')  # Extra safety
+                        accumulated_output = clean_buffer
+                        last_was_clear = False
+                    else:
+                        # Normal append behavior - clean before accumulating
+                        clean_buffer = _clean_ansi_sequences(buffer)
+                        clean_buffer = clean_buffer.replace('(B', '')  # Extra safety
+                        accumulated_output += clean_buffer
+
                     # Keep only last N characters to avoid message getting too long
-                    max_display = 3500
+                    max_display = 3500 if not tui_mode else 1200  # Much smaller for TUI to reduce height
                     if len(accumulated_output) > max_display:
-                        # Keep the last portion and add ellipsis
-                        accumulated_output = "...\n" + accumulated_output[-max_display:]
+                        if tui_mode:
+                            # For TUI, keep more recent content (likely current screen state)
+                            accumulated_output = accumulated_output[-max_display:]
+                        else:
+                            # For normal mode, add ellipsis
+                            accumulated_output = "...\n" + accumulated_output[-max_display:]
+
+                    # Format the message with final cleaning
+                    if tui_mode:
+                        # Clean up extra newlines for TUI mode
+                        clean_output = re.sub(r'\n{3,}', '\n\n', accumulated_output)
+                        # Final aggressive cleaning before display
+                        final_clean = _clean_ansi_sequences(clean_output)
+                        # Absolute last resort: manually remove (B at string level
+                        while '(B' in final_clean:
+                            final_clean = final_clean.replace('(B', '')
+                        display_text = f"```\n{final_clean}\n```"
+                    else:
+                        # Final aggressive cleaning before display
+                        final_clean = _clean_ansi_sequences(accumulated_output)
+                        # Absolute last resort: manually remove (B at string level
+                        while '(B' in final_clean:
+                            final_clean = final_clean.replace('(B', '')
+                        display_text = f"```\n{final_clean}\n```"
                     
-                    # Format the message
-                    display_text = f"```\n{accumulated_output}\n```"
-                    
+                    # Final debug check before sending
+                    if '(B' in display_text:
+                        print(f"ERROR: (B found in display_text right before sending!", flush=True)
+                        # Emergency removal
+                        display_text = display_text.replace('(B', '')
+
+                    # Check if content has actually changed to avoid unnecessary updates
+                    import hashlib
+                    content_hash = hashlib.md5(display_text.encode()).hexdigest()
+                    if content_hash == last_content_hash and last_message_id:
+                        # Content hasn't changed, skip update
+                        buffer = ""
+                        last_send_time = current_time
+                        continue
+                    last_content_hash = content_hash
+
                     try:
                         if last_message_id:
                             # Try to edit existing message
@@ -769,34 +1013,54 @@ async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                             except Exception as e:
                                 # If edit fails, send new message
                                 if "message is not modified" not in str(e).lower():
-                                    msg = await context.bot.send_message(
-                                        chat_id=chat_id,
-                                        text=display_text,
-                                        parse_mode=ParseMode.MARKDOWN
-                                    )
+                                    # Delete old message first to maintain order
+                                    try:
+                                        await context.bot.delete_message(chat_id=chat_id, message_id=last_message_id)
+                                    except:
+                                        pass
+
+                                    # Try with markdown first, fallback to plain text
+                                    try:
+                                        msg = await context.bot.send_message(
+                                            chat_id=chat_id,
+                                            text=display_text,
+                                            parse_mode=ParseMode.MARKDOWN
+                                        )
+                                    except Exception as md_error:
+                                        # Markdown failed, try plain text
+                                        msg = await context.bot.send_message(
+                                            chat_id=chat_id,
+                                            text=display_text
+                                        )
                                     last_message_id = msg.message_id
                         else:
-                            # First message - send new
-                            msg = await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=display_text,
-                                parse_mode=ParseMode.MARKDOWN
-                            )
-                            last_message_id = msg.message_id
-                        
-                        # Move keyboard to bottom if needed
-                        if keyboard_message_id:
+                            # First message - send new with fallback
                             try:
-                                await context.bot.delete_message(chat_id=chat_id, message_id=keyboard_message_id)
-                                keyboard_msg = await context.bot.send_message(
+                                msg = await context.bot.send_message(
                                     chat_id=chat_id,
-                                    text="🖥️ **Terminal Controls**",
-                                    parse_mode=ParseMode.MARKDOWN,
-                                    reply_markup=keyboard_builder.session_actions()
+                                    text=display_text,
+                                    parse_mode=ParseMode.MARKDOWN
                                 )
-                                keyboard_message_id = keyboard_msg.message_id
-                            except:
-                                pass
+                            except Exception as md_error:
+                                # Markdown failed, try plain text
+                                msg = await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=display_text
+                                )
+                            last_message_id = msg.message_id
+
+                            # Send keyboard AFTER first terminal output to maintain proper order
+                            if not keyboard_message_id:
+                                try:
+                                    keyboard_msg = await context.bot.send_message(
+                                        chat_id=chat_id,
+                                        text="🖥️ **Terminal Controls**",
+                                        parse_mode=ParseMode.MARKDOWN,
+                                        reply_markup=keyboard_builder.session_actions()
+                                    )
+                                    keyboard_message_id = keyboard_msg.message_id
+                                except:
+                                    pass
                     except Exception as e:
                         # If accumulated output is too long, save as file
                         if len(accumulated_output) > config.TG_MESSAGE_LIMIT:
@@ -850,6 +1114,16 @@ async def tail_output(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.delete_message(chat_id=chat_id, message_id=keyboard_message_id)
         except:
             pass
+
+    # Clean up database session when SSH connection ends
+    session = ssh_manager.get(chat_id)
+    if session and session.session_id:
+        try:
+            db_session = db.get_session_by_id(session.session_id)
+            if db_session:
+                db.delete_session(db_session.user_id)
+        except Exception as e:
+            logger.error(f"Error cleaning up database session: {e}")
 
 # ------------------------- WEBAPP COMMAND -------------------------
 
@@ -912,6 +1186,59 @@ def main():
         message_handler
     ))
     
+    # Auto-reconnect to active sessions after restart
+    async def auto_reconnect():
+        """Automatically reconnect to active SSH sessions after bot restart"""
+        try:
+            active_sessions = db.get_all_active_sessions()
+            logger.info(f"Found {len(active_sessions)} active sessions to restore")
+
+            for db_session in active_sessions:
+                if not db_session.chat_id or not db_session.connection_id:
+                    continue
+
+                try:
+                    # Get connection details
+                    connection = db.get_connection_by_id(db_session.user_id, db_session.connection_id)
+                    if not connection:
+                        logger.warning(f"Connection not found for session {db_session.session_id}")
+                        continue
+
+                    # Attempt to reconnect
+                    logger.info(f"Auto-reconnecting to {connection.name} for user {db_session.user_id}")
+                    session = ssh_manager.connect_saved(db_session.user_id, db_session.chat_id, connection.name)
+
+                    if session.connected:
+                        # Start output streaming
+                        session.task = asyncio.create_task(tail_output(db_session.chat_id, application))
+
+                        # Send notification
+                        await application.bot.send_message(
+                            chat_id=db_session.chat_id,
+                            text=f"🔄 **Auto-reconnected to {connection.name}**\n"
+                                f"Your session has been restored after bot restart.\n\n"
+                                f"Connected to: {connection.username}@{connection.host}:{connection.port}",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+
+                        logger.info(f"Successfully auto-reconnected session {db_session.session_id}")
+                    else:
+                        logger.warning(f"Failed to auto-reconnect session {db_session.session_id}")
+
+                except Exception as e:
+                    logger.error(f"Error auto-reconnecting session {db_session.session_id}: {e}")
+                    # Clean up failed session
+                    db.delete_session(db_session.user_id)
+
+        except Exception as e:
+            logger.error(f"Error during auto-reconnection: {e}")
+
+    # Schedule auto-reconnect to run after bot starts
+    application.job_queue.run_once(
+        lambda context: asyncio.create_task(auto_reconnect()),
+        when=2  # Wait 2 seconds after startup
+    )
+
     # Start bot
     logger.info("Starting SSH Terminal Bot...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
